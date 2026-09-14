@@ -292,6 +292,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Dispatch actions
+# No args/flags: launch the default environment's shell (like 'wsl')
+if [[ -z "$ACTION" ]]; then
+    ACTION="run"
+fi
 case "$ACTION" in
     install)
         # shellcheck source=/dev/null

@@ -46,6 +46,16 @@ lswd_ctrl() {
     echo "$resp"
 }
 
+# Enter an interactive LSW environment shell (host bash with Windows env set)
+enter_lsw_shell() {
+    local rcfile="${LSW_DISTROS_DIR}/$(get_default_distro)/rootfs/etc/lsw/bashrc.lsw"
+    if [[ -f "$rcfile" ]]; then
+        # shellcheck source=/dev/null
+        source "$rcfile"
+    fi
+    exec /bin/bash -i "$@"
+}
+
 # Main command runner
 lsw_run() {
     local distro="${1:-}"
@@ -67,8 +77,7 @@ lsw_run() {
     # Built-in console commands
     if [[ -z "$distro" ]] && [[ $# -eq 0 ]]; then
         warn "no command specified; launching default environment"
-        exec "$runtime" --windows=11 /bin/sh -c \
-            "echo 'LSW: Linux Subsystem for Windows'; echo 'Type exit to quit'; exec /bin/bash --rcfile /etc/lsw/bashrc.lsw"
+        enter_lsw_shell
         return 0
     fi
 
@@ -76,9 +85,8 @@ lsw_run() {
     case "$cmd" in
         cmd|cmd.exe)
             shift 2>/dev/null
-            warn "cmd.exe is not fully implemented; dropping to LSW shell"
-            exec "$runtime" "$@" \
-                /bin/bash --rcfile /etc/lsw/bashrc.lsw
+            warn "cmd.exe is not fully implemented; launching LSW shell instead"
+            enter_lsw_shell "$@"
             ;;
         powershell|powershell.exe|pwsh)
             shift 2>/dev/null
@@ -115,7 +123,7 @@ PYEOF
                 die "Windows program '$path' not found"
             else
                 warn "no command specified; entering LSW environment"
-                exec "$runtime" "$version_opt" /bin/sh -c "echo 'LSW environment'; exec /bin/bash --rcfile /etc/lsw/bashrc.lsw"
+                enter_lsw_shell
             fi
             ;;
     esac
