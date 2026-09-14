@@ -27,3 +27,6 @@ packaging/build/
 
 # Binary test programs
 *.exe
+
+# Bundled Windows System32 CLI executables (intentionally tracked)
+!distros/*/rootfs/**/*.exe

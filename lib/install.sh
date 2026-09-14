@@ -73,6 +73,20 @@ Version 10.0.${build}
 LSW Runtime 1.0.0
 EOF
 
+    # Overlay the bundled distro template (Windows System32 CLI executables).
+    # Installed packages carry it at ${LSW_SYSCONFDIR}/lsw/distros/<name>/rootfs;
+    # in a source tree it lives directly at ${LSW_SYSCONFDIR}/distros/<name>/rootfs.
+    local template_rootfs
+    for template_rootfs in \
+        "${LSW_SYSCONFDIR:-/etc}/lsw/distros/${distro}/rootfs" \
+        "${LSW_SYSCONFDIR:-/etc}/distros/${distro}/rootfs"; do
+        if [[ -d "${template_rootfs}/drive_c" ]]; then
+            info "Installing bundled Windows ${distro} system tools..."
+            cp -a "${template_rootfs}/drive_c/." "${drive_c}/"
+            break
+        fi
+    done
+
     info "Root filesystem created at ${rootfs_dir}"
     return 0
 }

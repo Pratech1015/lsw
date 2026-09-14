@@ -100,6 +100,14 @@ install: all
 	install -m 0644 distros/windows-11/setup.sh $(DESTDIR)$(SYSCONFDIR)/lsw/distros/windows-11/setup.sh
 	install -m 0644 distros/windows-10/setup.sh $(DESTDIR)$(SYSCONFDIR)/lsw/distros/windows-10/setup.sh
 
+	# Bundled Windows rootfs (System32 CLI executables) shipped with the distro
+	@if [ -d distros/windows-11/rootfs ]; then \
+		cp -a distros/windows-11/rootfs $(DESTDIR)$(SYSCONFDIR)/lsw/distros/windows-11/rootfs; \
+	fi
+	@if [ -d distros/windows-10/rootfs ]; then \
+		cp -a distros/windows-10/rootfs $(DESTDIR)$(SYSCONFDIR)/lsw/distros/windows-10/rootfs; \
+	fi
+
 	# Edition locking: an edition-scoped package (lsw-win-11 / lsw-win-10)
 	# writes /etc/lsw/edition so 'lsw' targets a single Windows version.
 	@if [ "$(EDITION)" != "all" ]; then \

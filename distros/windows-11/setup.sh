@@ -31,4 +31,10 @@ Version 10.0.${BUILD}
 LSW Runtime 1.0.0
 EOF
 
+# Copy bundled System32 CLI executables (shipped in this template's rootfs)
+if [[ -d "$(dirname "${BASH_SOURCE[0]}")/rootfs/drive_c" ]]; then
+    echo "Installing bundled Windows system tools..."
+    cp -a "$(dirname "${BASH_SOURCE[0]}")/rootfs/drive_c/." "${ROOTFS}/drive_c/"
+fi
+
 echo "${DISTRO} setup complete."
