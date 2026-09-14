@@ -1,0 +1,36 @@
+# Maintainer: PraTech <pratechs.in>
+# Contributor: LSW Contributors
+
+pkgname=lsw-win-10
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Linux Subsystem for Windows - Windows 10 edition. Run Windows 10 apps on Linux using the NTLL compatibility layer (no Wine). Edition-scoped, mirroring Microsoft Store packaging."
+arch=('x86_64')
+url="https://github.com/Pratech1015/lsw"
+license=('GPL3')
+depends=('gcc' 'make' 'gettext')
+makedepends=('tar')
+optdepends=('pwsh: PowerShell integration for lsw powershell')
+conflicts=('lsw' 'lsw-win-11')
+provides=('lsw')
+replaces=()
+source=("${pkgname}-${pkgver}.tar.gz::https://github.com/Pratech1015/lsw/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "${srcdir}/lsw-${pkgver}"
+    make PREFIX=/usr
+}
+
+check() {
+    cd "${srcdir}/lsw-${pkgver}"
+    make PREFIX=/usr test
+}
+
+package() {
+    cd "${srcdir}/lsw-${pkgver}"
+    make PREFIX=/usr DESTDIR="${pkgdir}" EDITION=windows-10 install
+
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}

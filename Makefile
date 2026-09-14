@@ -22,6 +22,8 @@ VERSION      = 1.0.0
 BUILD       ?= release
 BUILD_DIR    = build
 BIN_DIR      = $(BUILD_DIR)/bin
+# EDITION selectively installs one Windows version (lsw-win-11 / lsw-win-10)
+EDITION     ?= all
 
 NTLL_SRCS    = ntll/runtime.c ntll/pe_loader.c ntll/syscall.c ntll/process.c \
                ntll/memory.c ntll/kernel32.c ntll/dispatch.c ntll/strings.c \
@@ -84,19 +86,26 @@ install: all
 	install -m 0755 $(BIN_DIR)/lsw-init $(DESTDIR)$(LIBDIR)/lsw/lsw-init
 	ln -sf $(LIBDIR)/lsw/lsw-init $(DESTDIR)$(BINDIR)/lsw-init
 
-	# CLI scripts
+	# CLI scripts (flat: installed common.sh must be at $(LIBDIR)/lsw/common.sh)
 	install -m 0755 src/lsw $(DESTDIR)$(BINDIR)/lsw
-	install -d $(DESTDIR)$(LIBDIR)/lsw/lib
-	install -m 0644 lib/common.sh $(DESTDIR)$(LIBDIR)/lsw/lib/common.sh
-	install -m 0644 lib/install.sh $(DESTDIR)$(LIBDIR)/lsw/lib/install.sh
-	install -m 0644 lib/manage.sh $(DESTDIR)$(LIBDIR)/lsw/lib/manage.sh
-	install -m 0644 lib/runner.sh $(DESTDIR)$(LIBDIR)/lsw/lib/runner.sh
+	install -d $(DESTDIR)$(LIBDIR)/lsw
+	install -m 0644 lib/common.sh $(DESTDIR)$(LIBDIR)/lsw/common.sh
+	install -m 0644 lib/install.sh $(DESTDIR)$(LIBDIR)/lsw/install.sh
+	install -m 0644 lib/manage.sh $(DESTDIR)$(LIBDIR)/lsw/manage.sh
+	install -m 0644 lib/runner.sh $(DESTDIR)$(LIBDIR)/lsw/runner.sh
 
 	# Distro manifests & templates
 	install -m 0644 distros/windows-11/manifest.json $(DESTDIR)$(SYSCONFDIR)/lsw/distros/windows-11/manifest.json
 	install -m 0644 distros/windows-10/manifest.json $(DESTDIR)$(SYSCONFDIR)/lsw/distros/windows-10/manifest.json
 	install -m 0644 distros/windows-11/setup.sh $(DESTDIR)$(SYSCONFDIR)/lsw/distros/windows-11/setup.sh
 	install -m 0644 distros/windows-10/setup.sh $(DESTDIR)$(SYSCONFDIR)/lsw/distros/windows-10/setup.sh
+
+	# Edition locking: an edition-scoped package (lsw-win-11 / lsw-win-10)
+	# writes /etc/lsw/edition so 'lsw' targets a single Windows version.
+	@if [ "$(EDITION)" != "all" ]; then \
+		echo "$(EDITION)" > $(DESTDIR)$(SYSCONFDIR)/lsw/edition; \
+		echo "  Edition locked to: $(EDITION)"; \
+	fi
 
 	# Bash completion
 	install -d $(DESTDIR)$(DATADIR)/bash-completion/completions
@@ -143,5 +152,18 @@ pkg-rpm: all
 pkg-arch: all
 	cd packaging && makepkg -f
 
-.PHONY: all clean distclean install uninstall test lsw pkg-deb pkg-rpm pkg-arch
+# Source tarball used by the curl quick-start installer and releases
+PACKAGE_NAME = lsw-$(VERSION)
+
+release:
+	@echo "  Preparing $(PACKAGE_NAME).tar.gz ..."
+	@rm -rf $(BUILD_DIR)/release/$(PACKAGE_NAME)
+	@mkdir -p $(BUILD_DIR)/release/$(PACKAGE_NAME)
+	@tar --exclude='.git' --exclude='build' --exclude='build-tests' \
+	     --exclude='*.o' --exclude='lsw-runtime' --exclude='lswd' \
+	     -cf - . | (cd $(BUILD_DIR)/release/$(PACKAGE_NAME) && tar -xf -)
+	@cd $(BUILD_DIR)/release && tar -czf $(PACKAGE_NAME).tar.gz $(PACKAGE_NAME)
+	@echo "  -> $(BUILD_DIR)/release/$(PACKAGE_NAME).tar.gz"
+
+.PHONY: all clean distclean install uninstall test lsw pkg-deb pkg-rpm pkg-arch release
 .SUFFIXES: .c .o

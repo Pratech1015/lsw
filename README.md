@@ -60,20 +60,51 @@ Linux  ◄──►  WSL                     Windows  ◄──►  LSW
 
 ## Install
 
-### From a package manager
+### Quick start — curl (any Linux, no package manager)
 
-| Distro / PM       | Command |
-|-------------------|---------|
-| Arch / Manjaro    | `yay -S lsw` *(or pacman after publishing)* |
-| Debian / Ubuntu   | `sudo apt install lsw` |
-| Fedora / RHEL     | `sudo dnf install lsw` |
-| Homebrew (Linux)  | `brew install lsw` |
-| openSUSE          | `zypper in lsw` |
+One command installs a minimal, rootless `lsw` (sources + launcher under
+`~/.lsw`) from which you can install a Windows version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Pratech1015/lsw/main/bootstrap/lsw-install.sh | bash
+lsw --install windows-11
+```
+
+This never touches the system package manager, so it never collides with other
+software.
+
+### Arch / Manjaro — AUR (edition packages, like the Microsoft Store)
+
+Windows versions ship as separate editions, exactly like the Store:
+
+| Edition        | Package         | Command                    |
+|----------------|-----------------|----------------------------|
+| **Windows 11** | `lsw-win-11`    | `yay -S lsw-win-11`        |
+| **Windows 10** | `lsw-win-10`    | `yay -S lsw-win-10`        |
+
+Each edition package installs the full LSW runtime and locks `lsw` to that one
+Windows version (`/etc/lsw/edition`). Install one or both — `lsw` picks up the
+matching edition. Run `lsw --install windows-11` afterwards to bootstrap the
+Windows 11 root filesystem.
+
+> Note: a *different* project named `lsw` (`lsw` — list window names, a small
+> suckless X utility) already exists in the Arch `extra` repos. To avoid that
+> collision, LSW ships on AUR as `lsw-win-11`/`lsw-win-10`; installing either
+> edition replaces the suckless `lsw` conflict-free (`conflicts=lsw`).
+
+### Other package managers
+
+| Distro / PM      | Status  | Command |
+|------------------|---------|---------|
+| Debian / Ubuntu  | planned | `sudo apt install lsw` |
+| Fedora / RHEL    | planned | `sudo dnf install lsw` |
+| Homebrew (Linux) | planned | `brew install lsw` |
+| openSUSE         | planned | `zypper in lsw` |
 
 ### From source
 
 ```bash
-git clone https://github.com/lsw-project/lsw.git
+git clone https://github.com/Pratech1015/lsw.git
 cd lsw
 make && sudo make install
 ```

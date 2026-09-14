@@ -8,14 +8,27 @@ declare -A DISTRO_SIZES=(
     ["windows-10"]="~1.0 GB"
 )
 
-# List online distros
+# Fallback if ENABLED_DISTROS not set by the CLI
+: "${ENABLED_DISTROS:=windows-11 windows-10}"
+
+# List online distros (respects edition scoping)
 list_online_distros() {
     echo -e "${BOLD}Available Windows versions:${NC}"
     echo ""
     printf "  ${BOLD}%-20s %-12s %-10s %-30s${NC}\n" "NAME" "BUILD" "SIZE" "DESCRIPTION"
     printf "  %-20s %-12s %-10s %-30s\n" "----" "-----" "----" "-----------"
-    printf "  ${GREEN}%-20s${NC} %-12s %-10s %-30s\n" "windows-11" "22631" "${DISTRO_SIZES[windows-11]}" "${DISTRO_DESCS[windows-11]}" "(default)"
-    printf "  ${GREEN}%-20s${NC} %-12s %-10s %-30s\n" "windows-10" "19045" "${DISTRO_SIZES[windows-10]}" "${DISTRO_DESCS[windows-10]}"
+    local d default
+    default=$(get_default_distro)
+    for d in "${ENABLED_DISTROS[@]}"; do
+        local marker=""
+        [[ "$d" == "$default" ]] && marker="  (default)"
+        printf "  ${GREEN}%-20s${NC} %-12s %-10s %-30s%s\n" \
+            "$d" \
+            "${DISTRO_BUILDS[$d]:-?}" \
+            "${DISTRO_SIZES[$d]:-?}" \
+            "${DISTRO_DESCS[$d]:-?}" \
+            "$marker"
+    done
     echo ""
     echo "Use 'lsw --install <distro>' to install."
 }
@@ -104,7 +117,7 @@ build_runtime() {
     [[ $built -eq 0 ]] || die "build failed"
 
     local dest="${LSW_PREFIX}/lib/lsw/lsw-runtime"
-    mkdir -p "$(dirname "$dest")"
+    mkdir -p "$(dirname "$dest")" "${LSW_PREFIX}/bin"
     cp "$build_dir/lsw-runtime" "$dest"
     chmod 0755 "$dest"
 
@@ -264,6 +277,13 @@ lsw_install() {
         exit 1
     fi
 
+    if [[ " ${ENABLED_DISTROS[*]:-} " != *" $distro "* ]]; then
+        echo -e "${RED}error:${NC} '${distro}' is not available in this LSW edition"
+        echo ""
+        list_online_distros
+        exit 1
+    fi
+
     check_toolchain
     ensure_dirs
 
@@ -272,8 +292,12 @@ lsw_install() {
     local distro_dir="${LSW_DISTROS_DIR}/${distro}"
     mkdir -p "$distro_dir"
 
-    # 1. Build the NTLL runtime
-    build_runtime
+    # 1. Build the NTLL runtime (unless already installed by a package)
+    if [[ -x "${LIB_DIR}/lsw-runtime" ]]; then
+        info "LSW runtime already installed; skipping build"
+    else
+        build_runtime
+    fi
 
     # 2. Bootstrap the Windows root filesystem
     bootstrap_rootfs "$distro"

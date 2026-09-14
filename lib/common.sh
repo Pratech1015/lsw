@@ -40,10 +40,10 @@ set_default_distro() {
     echo "$distro" > "${LSW_CONFIG_DIR}/default"
 }
 
-# Check if a distro is installed
+# Check if a distro is installed (has an actual root filesystem)
 is_distro_installed() {
     local distro="$1"
-    [[ -d "${LSW_DISTROS_DIR}/${distro}" ]]
+    [[ -d "${LSW_DISTROS_DIR}/${distro}/rootfs" ]]
 }
 
 # Get distro root path

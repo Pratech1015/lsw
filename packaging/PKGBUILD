@@ -1,16 +1,25 @@
 # Maintainer: LSW Contributors <dev@lsw.dev>
 # Contributor: LSW project
+#
+# NOTE: The Arch package name "lsw" is taken by the unrelated suckless
+# "lsw - list window names" utility in the `extra` repos, so LSW is published
+# on the AUR as edition-scoped packages:
+#   - packaging/aur/lsw-win-11/PKGBUILD   (Windows 11 edition)
+#   - packaging/aur/lsw-win-10/PKGBUILD   (Windows 10 edition)
+#
+# This generic template targets distros that do not already have an `lsw`.
+
 pkgname=lsw
 pkgver=1.0.0
 pkgrel=1
-pkgdesc="Linux Subsystem for Windows - run Windows 11 apps on Linux with your own NTLL compatibility layer"
+pkgdesc="Linux Subsystem for Windows - run Windows apps on Linux with your own NTLL compatibility layer (no Wine)"
 arch=('x86_64')
-url="https://github.com/lsw-project/lsw"
+url="https://github.com/Pratech1015/lsw"
 license=('GPL3')
 depends=('gcc' 'make' 'gettext')
 makedepends=()
 optdepends=()
-source=("lsw-${pkgver}.tar.gz::https://github.com/lsw-project/lsw/archive/refs/tags/v${pkgver}.tar.gz")
+source=("lsw-${pkgver}.tar.gz::https://github.com/Pratech1015/lsw/archive/refs/tags/v${pkgver}.tar.gz")
 sha256sums=('SKIP')
 
 build() {

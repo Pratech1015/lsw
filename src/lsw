@@ -21,16 +21,20 @@ LSW_DISTROS_DIR="${LSW_DISTROS_DIR:-/var/lib/lsw/distros}"
 LSW_PREFIX="${LSW_PREFIX:-/usr}"
 LIB_DIR="${LSW_PREFIX}/lib/lsw"
 
+# Resolve symlinks so 'lsw' works when reached through a PATH shim/symlink
+_self="$(readlink -f "${BASH_SOURCE[0]:-}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+_script_dir="$(cd "$(dirname "$_self")" && pwd)"
+unset _self
+
 # When running from a source tree, locate libraries relative to this script
 if [[ ! -f "${LIB_DIR}/common.sh" ]]; then
-    _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     for _cand in "${_script_dir}/../lib" "${_script_dir}/lib"; do
         if [[ -f "${_cand}/common.sh" ]]; then
             LIB_DIR="$_cand"
             break
         fi
     done
-    unset _cand _script_dir
+    unset _cand
 fi
 
 # In an unpackaged source tree with no explicit dirs, use user-writable locations
@@ -38,9 +42,18 @@ if [[ ${#_explicit_dirs[@]} -eq 0 && "$LIB_DIR" != "${LSW_PREFIX}/lib/lsw" ]]; t
     LSW_DATA_DIR="${HOME}/.lsw/data"
     LSW_DISTROS_DIR="${HOME}/.lsw/distros"
     LSW_CONFIG_DIR="${HOME}/.lsw"
+    # Keep everything rootless under $HOME/.lsw (runtime, symlinks, state)
+    [[ "$LSW_PREFIX" == "/usr" ]] && LSW_PREFIX="${HOME}/.lsw"
 fi
 unset _explicit_dirs
 mkdir -p "${LSW_DATA_DIR}" "${LSW_DISTROS_DIR}" "${LSW_CONFIG_DIR}" 2>/dev/null || true
+
+# Edition scoping: a per-edition install (lsw-win-11 / lsw-win-10 package or
+# /etc/lsw/edition file) restricts LSW to a single Windows version.
+EDITION="${EDITION:-}"
+if [[ -z "$EDITION" && -f "${LSW_CONFIG_DIR}/edition" ]]; then
+    EDITION="$(head -n1 "${LSW_CONFIG_DIR}/edition" 2>/dev/null || true)"
+fi
 
 # Colors
 RED='\033[0;31m'
@@ -90,19 +103,22 @@ ${BOLD}Examples:${NC}
     lsw ping google.com
 
 ${BOLD}Package Managers:${NC}
-    Arch Linux/Manjaro:  yay -S lsw
-    Debian/Ubuntu:       sudo apt install lsw
-    Fedora/RHEL:         sudo dnf install lsw
-    Homebrew:            brew install lsw
+    Arch Linux/Manjaro:  yay -S lsw-win-11   (or: lsw-win-10)
+    Debian/Ubuntu:       (coming soon)
+    Fedora/RHEL:         (coming soon)
+    Homebrew:            (coming soon)
 
-${BOLD}Website:${NC}      https://github.com/lsw-project/lsw
-${BOLD}Documentation:${NC} https://docs.lsw.dev
+${BOLD}Quick start (any Linux):${NC}
+    curl -fsSL https://raw.githubusercontent.com/Pratech1015/lsw/main/bootstrap/lsw-install.sh | bash
+    lsw --install windows-11
+
+${BOLD}Website:${NC}      https://github.com/Pratech1015/lsw
 EOF
 }
 
 version_info() {
     echo "LSW version ${LSW_VERSION} (${LSW_BUILD})"
-    echo "Target: Windows 11 (Build 22631)"
+    echo "Target: ${EDITION:-Windows 11 (Build 22631)}"
     echo "NTLL compatibility layer"
 }
 
@@ -139,6 +155,21 @@ load_config() {
 if [[ -f "${LIB_DIR}/common.sh" ]]; then
     # shellcheck source=/dev/null
     source "${LIB_DIR}/common.sh"
+    # Available (enabled) distros - usually all known, or a single one when
+    # this is an edition-scoped install (lsw-win-11 / lsw-win-10).
+    if [[ -n "$EDITION" ]]; then
+        if [[ -n "${DISTRO_BUILDS[$EDITION]:-}" ]]; then
+            LSW_DEFAULT_DISTRO="$EDITION"
+            ENABLED_DISTROS=("$EDITION")
+        else
+            echo -e "${YELLOW}warning:${NC} edition '${EDITION}' is not a known version" >&2
+            EDITION=""
+        fi
+    fi
+    if [[ -z "${ENABLED_DISTROS:-}" ]]; then
+        # Keep a stable, sensible order
+        ENABLED_DISTROS=("windows-11" "windows-10")
+    fi
 fi
 
 # Parse arguments
