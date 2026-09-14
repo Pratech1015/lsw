@@ -1,0 +1,16 @@
+Source: lsw
+Section: utils
+Priority: optional
+Maintainer: LSW Contributors <dev@lsw.dev>
+Build-Depends: debhelper (>= 12), gcc, make
+Standards-Version: 4.5.1
+Homepage: https://github.com/lsw-project/lsw
+
+Package: lsw
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, gcc, make
+Description: Linux Subsystem for Windows
+ LSW brings Windows 11 to Linux the same way WSL brought Linux to
+ Windows. Includes the NTLL (NT Layer Library) runtime: a PE32+
+ loader, NT syscall translation layer, and Win32 API implementation
+ with zero dependency on Wine.

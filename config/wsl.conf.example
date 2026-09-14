@@ -1,0 +1,35 @@
+# LSW configuration template (WSL-compatible format)
+# This mirrors the /etc/wsl.conf format so Windows users feel at home.
+# Copy to /etc/lsw/lsw.conf to use.
+
+[boot]
+systemd=false
+command=""
+
+[network]
+hostname="Windows11"
+generateResolvConf=true
+generateHosts=true
+
+[interop]
+appendWindowsPath=true
+enabled=true
+
+[automount]
+enabled=true
+root="/mnt/"
+options="metadata,umask=22,fmask=11"
+
+[user]
+default="Administrator"
+
+[gui]
+enabled=false
+theme="dark"
+
+[windows]
+version="windows-11"
+build="22631"
+compatibility="high"
+gpu_acceleration=true
+audio=true

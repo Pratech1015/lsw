@@ -1,0 +1,38 @@
+# bash completion for lsw
+_lsw() {
+    local cur prev opts
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    opts="--install --list --set-default --set-version --shutdown --terminate
+          --unregister --status --update --export --import --config --version
+          --help cmd powershell notepad explorer --online"
+
+    # Complete options
+    if [[ ${cur} == -* ]]; then
+        COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+        return 0
+    fi
+
+    case "${prev}" in
+        --install)
+            COMPREPLY=( $(compgen -W "windows-11 windows-10" -- "${cur}") )
+            return 0
+            ;;
+        --set-default|--set-version|--terminate|--unregister|--status|--update|--export|--import|--config)
+            COMPREPLY=( $(compgen -W "$(lsw --list 2>/dev/null | grep -oP '^\s+\K[a-z0-9-]+' || echo 'windows-11 windows-10')" -- "${cur}") )
+            return 0
+            ;;
+        --help)
+            COMPREPLY=( )
+            return 0
+            ;;
+    esac
+
+    # Default to file completion
+    COMPREPLY=( $(compgen -f -- "${cur}") )
+    return 0
+}
+
+complete -F _lsw lsw

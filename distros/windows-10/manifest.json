@@ -1,0 +1,12 @@
+{
+    "name": "windows-10",
+    "display_name": "Microsoft Windows 10 Pro",
+    "windows_version": "10.0.19045",
+    "build_number": "19045",
+    "runtime": "NTLL",
+    "runtime_version": "1.0.0",
+    "architecture": "x86_64",
+    "gui": "disabled",
+    "status": "available",
+    "repository": "https://github.com/lsw-project/lsw"
+}

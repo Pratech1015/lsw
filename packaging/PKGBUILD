@@ -1,0 +1,30 @@
+# Maintainer: LSW Contributors <dev@lsw.dev>
+# Contributor: LSW project
+pkgname=lsw
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Linux Subsystem for Windows - run Windows 11 apps on Linux with your own NTLL compatibility layer"
+arch=('x86_64')
+url="https://github.com/lsw-project/lsw"
+license=('GPL3')
+depends=('gcc' 'make' 'gettext')
+makedepends=()
+optdepends=()
+source=("lsw-${pkgver}.tar.gz::https://github.com/lsw-project/lsw/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "${srcdir}/lsw-${pkgver}"
+    make PREFIX=/usr
+}
+
+package() {
+    cd "${srcdir}/lsw-${pkgver}"
+    make PREFIX=/usr DESTDIR="${pkgdir}" install
+
+    # Install license
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+
+    # Create the sysconfig data dirs
+    mkdir -p "${pkgdir}/var/lib/lsw"
+}

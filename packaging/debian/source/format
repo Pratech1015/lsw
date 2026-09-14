@@ -1,0 +1,6 @@
+dput template: linux
+Format: 3.0 (quilt)
+Source: lsw
+Testsuite: autopkgtest-pkg-debhelper
+Homepage: https://github.com/lsw-project/lsw
+Standards-Version: 4.5.1

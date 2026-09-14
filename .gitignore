@@ -1,0 +1,29 @@
+# Build artifacts
+*.o
+*.so
+*.a
+lsw-runtime
+lswd
+lsw-init
+build-tests/
+build/
+
+# Packaging
+packaging/build/
+*.deb
+*.rpm
+*.pkg.tar.zst
+*.tar.gz
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Temporary
+*.tmp
+*.bak
+/tmp-test/
+
+# Binary test programs
+*.exe
