@@ -14,6 +14,23 @@
 
 static PNTLL_MODULE g_main_module = NULL;
 
+/*
+ * Builtin programs shipped with LSW: cmd.exe and a small set of console
+ * apps (winver, hostname, whoami, echo, ver, date, time). These are
+ * compiled into the runtime so no PE image is required. Returns >=0 when
+ * handled, -1 otherwise.
+ */
+static int run_builtin(const char* base, int argc, char** argv) {
+    size_t len = strlen(base);
+    const char* ext = (len > 4) ? base + (len - 4) : NULL;
+
+    if (strcasecmp(base, "cmd") == 0 || strcasecmp(base, "cmd.exe") == 0 ||
+        (ext && (strcasecmp(ext, ".bat") == 0 || strcasecmp(ext, ".cmd") == 0))) {
+        return nt_builtin_cmd(argc, argv);
+    }
+    return nt_builtin_exec(base, argc, argv);
+}
+
 static void usage(const char* prog) {
     fprintf(stderr,
         "LSW runtime v%s\n"
@@ -84,6 +101,16 @@ int main(int argc, char* argv[]) {
     ntll_init();
 
     NTLL_LOG_INFO("starting LSW runtime v%s", NTLL_VERSION);
+
+    // Try the builtin program set first (cmd.exe, winver, ..., *.bat)
+    const char* base = strrchr(program, '/');
+    base = base ? base + 1 : program;
+    int builtin = run_builtin(base, argc - rest_start, &argv[rest_start]);
+    if (builtin >= 0) {
+        ntll_cleanup();
+        return builtin;
+    }
+
     NTLL_LOG_INFO("image: %s", program);
 
     // Load the executable

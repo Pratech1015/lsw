@@ -418,6 +418,10 @@ typedef struct _NTLL_OS_VERSION {
 const NTLL_OS_VERSION* nt_get_os_version(void);
 void nt_set_os_version(DWORD major, DWORD minor, DWORD build);
 
+/* Builtin Windows software + cmd.exe interpreter (implemented in cmd.c) */
+int nt_builtin_cmd(int argc, char** argv);
+int nt_builtin_exec(const char* program, int argc, char** argv);
+
 /* Logging */
 void ntll_log(int level, const char* format, ...);
 #define NTLL_LOG_INFO(...) ntll_log(0, __VA_ARGS__)

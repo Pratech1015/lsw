@@ -74,6 +74,10 @@ lsw_run() {
     local version_opt="--windows=11"
     [[ "$distro" == "windows-10" ]] && version_opt="--windows=10"
 
+    # Rootfs the builtin cmd.exe / NTLL path helpers operate on
+    local rootfs="${LSW_DISTROS_DIR}/$(get_default_distro)/rootfs"
+    export LSW_ROOTFS="$rootfs"
+
     # Built-in console commands
     if [[ -z "$distro" ]] && [[ $# -eq 0 ]]; then
         warn "no command specified; launching default environment"
@@ -85,8 +89,7 @@ lsw_run() {
     case "$cmd" in
         cmd|cmd.exe)
             shift 2>/dev/null
-            warn "cmd.exe is not fully implemented; launching LSW shell instead"
-            enter_lsw_shell "$@"
+            exec "$runtime" "$version_opt" "$cmd" "$@"
             ;;
         powershell|powershell.exe|pwsh)
             shift 2>/dev/null
@@ -104,16 +107,16 @@ lsw_run() {
             # Windows executable path
             local path="${cmd:-}"
             if [[ -n "$path" && -e "$path" ]]; then
-                # Resolve win32 path if given
-                local winpath
-                winpath=$(python3 - "$path" <<'PYEOF' 2>/dev/null || echo "$path"
-import os,sys
-p=os.path.abspath(sys.argv[1])
-print(p)
-PYEOF
-)
-                exec "$runtime" "$version_opt" "$winpath" "${@:2}"
+                exec "$runtime" "$version_opt" "$path" "${@:2}"
             elif [[ -n "$path" ]]; then
+                # Builtin Windows software / console tools shipped with LSW
+                case "$path" in
+                    winver|winver.exe|hostname|hostname.exe|whoami|whoami.exe|\
+                    echo|echo.exe|ver|ver.exe|date|date.exe|time|time.exe|\
+                    *.bat|*.cmd)
+                        exec "$runtime" "$version_opt" "$path" "${@:2}"
+                        ;;
+                esac
                 # Try system32 lookup
                 local sys_search
                 sys_search=$(find "${LSW_DISTROS_DIR}/windows-11/rootfs" -name "$path" -type f 2>/dev/null | head -1)

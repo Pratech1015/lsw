@@ -96,6 +96,30 @@ else
 fi
 
 echo ""
+echo "-- Builtin cmd.exe / Windows Software Tests --"
+RUNTIME="${CURRENT_DIR}/../build/bin/lsw-runtime"
+if [[ -x "$RUNTIME" ]]; then
+    ROOTFS_TMP="${BUILD_DIR}/rootfs-test"
+    mkdir -p "${ROOTFS_TMP}/drive_c"
+    out="$(LSW_ROOTFS="$ROOTFS_TMP" "$RUNTIME" cmd.exe 2>/dev/null <<'EOF'
+echo hi > t.txt
+type t.txt
+set VAR=hello world
+echo %VAR%
+hostname
+winver
+exit
+EOF
+)"
+    assert_contains "cmd banner present" "Microsoft Windows [Version" "$out"
+    assert_contains "echo redirect + type roundtrip" "hi" "$out"
+    assert_contains "set with spaces + %%VAR%% expansion" "hello world" "$out"
+    assert_contains "hostname builtin works" "$(hostname || echo LAPTOP)" "$out"
+else
+    todo "builtin cmd.exe test"
+fi
+
+echo ""
 echo "-- PE Header Parsing Tests --"
 cat > test_pe.c <<'EOF'
 #include <stdio.h>
