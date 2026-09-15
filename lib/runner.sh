@@ -117,12 +117,9 @@ lsw_run() {
                         exec "$runtime" "$version_opt" "$path" "${@:2}"
                         ;;
                 esac
-                # Try system32 lookup
-                local sys_search
-                sys_search=$(find "${LSW_DISTROS_DIR}/windows-11/rootfs" -name "$path" -type f 2>/dev/null | head -1)
-                if [[ -n "$sys_search" ]]; then
-                    exec "$runtime" "$version_opt" "$sys_search" "${@:2}"
-                fi
+                # Native tool dispatch (ipconfig, ping, netstat, ...) — the
+                # runtime resolves these via nt_tool_dispatch before PE load.
+                exec "$runtime" "$version_opt" "$path" "${@:2}"
                 die "Windows program '$path' not found"
             else
                 warn "no command specified; entering LSW environment"

@@ -76,16 +76,24 @@ EOF
     # Overlay the bundled distro template (Windows System32 CLI executables).
     # Installed packages carry it at ${LSW_SYSCONFDIR}/lsw/distros/<name>/rootfs;
     # in a source tree it lives directly at ${LSW_SYSCONFDIR}/distros/<name>/rootfs.
-    local template_rootfs
+    # Skip a candidate that resolves to the destination itself (a source tree
+    # laid out with the rootfs where the per-user install also lives).
+    local template_rootfs _dest_resolved _cand_resolved
+    _dest_resolved="$(realpath "${rootfs_dir}" 2>/dev/null)"
     for template_rootfs in \
         "${LSW_SYSCONFDIR:-/etc}/lsw/distros/${distro}/rootfs" \
         "${LSW_SYSCONFDIR:-/etc}/distros/${distro}/rootfs"; do
         if [[ -d "${template_rootfs}/drive_c" ]]; then
+            _cand_resolved="$(realpath "${template_rootfs}" 2>/dev/null)"
+            if [[ -n "$_dest_resolved" && "$_cand_resolved" == "$_dest_resolved" ]]; then
+                continue
+            fi
             info "Installing bundled Windows ${distro} system tools..."
             cp -a "${template_rootfs}/drive_c/." "${drive_c}/"
             break
         fi
     done
+    unset template_rootfs _dest_resolved _cand_resolved
 
     info "Root filesystem created at ${rootfs_dir}"
     return 0

@@ -593,6 +593,10 @@ static int cmd_execute_command(char* line) {
     int r = nt_builtin_exec(argv[0], argc, argv);
     if (r >= 0) return r;
 
+    /* Native reimplementations of bundled System32 CLI tools */
+    r = nt_tool_dispatch(argv[0], argc, argv);
+    if (r >= 0) return r;
+
     /* attempt to run a batch file placed in cwd */
     char trypath[CMD_MAX_LINE];
     win_to_unix(argv[0], trypath, sizeof(trypath));

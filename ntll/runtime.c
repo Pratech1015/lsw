@@ -28,7 +28,11 @@ static int run_builtin(const char* base, int argc, char** argv) {
         (ext && (strcasecmp(ext, ".bat") == 0 || strcasecmp(ext, ".cmd") == 0))) {
         return nt_builtin_cmd(argc, argv);
     }
-    return nt_builtin_exec(base, argc, argv);
+    int r = nt_builtin_exec(base, argc, argv);
+    if (r >= 0) return r;
+
+    /* Native reimplementations of bundled System32 CLI tools (ipconfig, ping, ...) */
+    return nt_tool_dispatch(base, argc, argv);
 }
 
 static void usage(const char* prog) {

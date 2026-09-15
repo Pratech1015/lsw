@@ -422,6 +422,9 @@ void nt_set_os_version(DWORD major, DWORD minor, DWORD build);
 int nt_builtin_cmd(int argc, char** argv);
 int nt_builtin_exec(const char* program, int argc, char** argv);
 
+/* Native reimplementations of bundled Windows System32 CLI tools (tools.c) */
+int nt_tool_dispatch(const char* program, int argc, char** argv);
+
 /* Logging */
 void ntll_log(int level, const char* format, ...);
 #define NTLL_LOG_INFO(...) ntll_log(0, __VA_ARGS__)
