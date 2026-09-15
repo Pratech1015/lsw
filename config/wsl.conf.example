@@ -19,6 +19,10 @@ enabled=true
 enabled=true
 root="/mnt/"
 options="metadata,umask=22,fmask=11"
+# Host drive mounts exposed to the Windows environment as drive letters.
+# Format: comma-separated "letter=hostpath" pairs. "d=/" maps D:\ to the
+# Linux root, so every other partition is reachable from within Windows.
+mounts="d=/"
 
 [user]
 default="Administrator"

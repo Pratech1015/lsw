@@ -89,7 +89,13 @@ static void win_to_unix(const char* win, char* out, size_t out_sz) {
     char tmp[CMD_MAX_LINE];
     if (isalpha((unsigned char)win[0]) && win[1] == ':') {
         char drive_lc = (char)tolower((unsigned char)win[0]);
-        snprintf(tmp, sizeof(tmp), "%s/drive_%c%s", g_rootfs, drive_lc, win + 2);
+        if (nt_mount_lookup(drive_lc, tmp, sizeof(tmp)) == 0) {
+            char joined[CMD_MAX_LINE];
+            snprintf(joined, sizeof(joined), "%s%s", tmp, win + 2);
+            snprintf(tmp, sizeof(tmp), "%s", joined);
+        } else {
+            snprintf(tmp, sizeof(tmp), "%s/drive_%c%s", g_rootfs, drive_lc, win + 2);
+        }
     } else if (win[0] == '\\') {
         snprintf(tmp, sizeof(tmp), "%s%s", g_drive_c, win);
     } else if (win[0] == '/') {
@@ -118,7 +124,21 @@ static void unix_to_win(const char* unix_path, char* out, size_t out_sz) {
         const char* rest = (unix_path[dc] == '/') ? unix_path + dc + 1 : unix_path + dc;
         snprintf(out, out_sz, "C:\\%s", rest);
     } else {
-        snprintf(out, out_sz, "%s", unix_path);
+        /* host mounts (D: -> /, ...) take precedence over drive_c paths */
+        char m[4096];
+        int mapped = 0;
+        for (char d = 'a'; d <= 'z' && !mapped; d++) {
+            if (nt_mount_lookup(d, m, sizeof(m)) != 0) continue;
+            size_t ml = strlen(m);
+            int root_mount = (ml == 1 && m[0] == '/');
+            if (strncmp(unix_path, m, ml) == 0 &&
+                (root_mount || unix_path[ml] == '/' || unix_path[ml] == '\0')) {
+                const char* rest = root_mount ? unix_path + ml : (unix_path[ml] ? unix_path + ml + 1 : "");
+                snprintf(out, out_sz, "%c:\\%s", (char)(d - 'a' + 'A'), rest);
+                mapped = 1;
+            }
+        }
+        if (!mapped) snprintf(out, out_sz, "%s", unix_path);
     }
     for (char* p = out; *p; p++) if (*p == '/') *p = '\\';
     if (strcmp(out, "C:\\") == 0) out[2] = '\0';

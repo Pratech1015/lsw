@@ -425,6 +425,9 @@ int nt_builtin_exec(const char* program, int argc, char** argv);
 /* Native reimplementations of bundled Windows System32 CLI tools (tools.c) */
 int nt_tool_dispatch(const char* program, int argc, char** argv);
 
+/* Host drive mounts from LSW_MOUNTS / lsw.conf [automount] (mounts.c) */
+int nt_mount_lookup(char drive_letter, char* out, size_t sz);
+
 /* Logging */
 void ntll_log(int level, const char* format, ...);
 #define NTLL_LOG_INFO(...) ntll_log(0, __VA_ARGS__)

@@ -94,8 +94,13 @@ int nt_to_unix_path(const char* nt_path, char* unix_path, int max_len) {
     char buffer[MAX_PATH * 4];
 
     if (nt_path[0] >= 'A' && nt_path[0] <= 'Z' && nt_path[1] == ':') {
-        snprintf(buffer, sizeof(buffer), "%s/drive_%c/%s", system_root,
-                 (char)(nt_path[0] - 'A' + 'a'), nt_path + 3);
+        char mounts[1024];
+        if (nt_mount_lookup((char)(nt_path[0] - 'A' + 'a'), mounts, sizeof(mounts)) == 0) {
+            snprintf(buffer, sizeof(buffer), "%s%s", mounts, nt_path + 2);
+        } else {
+            snprintf(buffer, sizeof(buffer), "%s/drive_%c/%s", system_root,
+                     (char)(nt_path[0] - 'A' + 'a'), nt_path + 3);
+        }
     } else if (nt_path[0] == '\\' && nt_path[1] == '\\') {
         snprintf(buffer, sizeof(buffer), "%s/drive_c/share%s", system_root, nt_path + 2);
     } else if (nt_path[0] == '\\') {
@@ -128,6 +133,24 @@ int unix_to_nt_path(const char* unix_path, char* nt_path, int max_len) {
             snprintf(nt_path, (size_t)max_len, "D:\\%s", unix_path + sr_len + 9);
         } else {
             snprintf(nt_path, (size_t)max_len, "\\%s", unix_path + sr_len + 1);
+        }
+    } else if (unix_path[0] == '/') {
+        /* host mounts (D: -> /, ...) */
+        char m[1024];
+        int mapped = 0;
+        for (char d = 'a'; d <= 'z' && !mapped; d++) {
+            if (nt_mount_lookup(d, m, sizeof(m)) != 0) continue;
+            size_t ml = strlen(m);
+            int root_mount = (ml == 1 && m[0] == '/');
+            if (strncmp(unix_path, m, ml) == 0 &&
+                (root_mount || unix_path[ml] == '/' || unix_path[ml] == '\0')) {
+                const char* rest = root_mount ? unix_path + ml : (unix_path[ml] ? unix_path + ml + 1 : "");
+                snprintf(nt_path, (size_t)max_len, "%c:\\%s", (char)(d - 'a' + 'A'), rest);
+                mapped = 1;
+            }
+        }
+        if (!mapped) {
+            snprintf(nt_path, (size_t)max_len, "%s", unix_path);
         }
     } else {
         snprintf(nt_path, (size_t)max_len, "%s", unix_path);

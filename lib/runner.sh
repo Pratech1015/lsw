@@ -78,6 +78,17 @@ lsw_run() {
     local rootfs="${LSW_DISTROS_DIR}/$(get_default_distro)/rootfs"
     export LSW_ROOTFS="$rootfs"
 
+    # Host drive mounts from lsw.conf [automount] mounts= (e.g. "d=/" maps
+    # D:\ to the Linux root). Passed to the runtime via LSW_MOUNTS.
+    local conf="${LSW_DISTROS_DIR}/$(get_default_distro)/lsw.conf"
+    local mounts
+    if [[ -f "$conf" ]]; then
+        mounts=$(sed -n 's/^[[:space:]]*mounts="\{0,1\}\([^"#]*\)"\{0,1\}.*/\1/p' "$conf" | head -1)
+    fi
+    if [[ -n "${mounts:-}" ]]; then
+        export LSW_MOUNTS="$mounts"
+    fi
+
     # Built-in console commands
     if [[ -z "$distro" ]] && [[ $# -eq 0 ]]; then
         warn "no command specified; launching default environment"
