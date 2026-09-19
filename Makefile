@@ -27,7 +27,8 @@ EDITION     ?= all
 
 NTLL_SRCS    = ntll/runtime.c ntll/pe_loader.c ntll/syscall.c ntll/process.c \
                ntll/memory.c ntll/kernel32.c ntll/dispatch.c ntll/strings.c \
-               ntll/registry.c ntll/ntdll.c ntll/cmd.c ntll/tools.c ntll/mounts.c
+               ntll/registry.c ntll/ntdll.c ntll/cmd.c ntll/tools.c ntll/mounts.c \
+               ntll/ucrtbase.c
 NTLL_OBJS    = $(patsubst ntll/%.c,$(BUILD_DIR)/ntll/%.o,$(NTLL_SRCS))
 
 LSWD_SRCS    = lswd/lswd.c

@@ -3,11 +3,17 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <wchar.h>
+
+typedef unsigned int  UINT;
+typedef wint_t        WINT_T;
 
 typedef int8_t      INT8;
 typedef uint8_t     UINT8;
 typedef int16_t     INT16;
+typedef int16_t     SHORT;
 typedef uint16_t    UINT16;
+typedef uint16_t    USHORT;
 typedef int32_t     INT32;
 typedef uint32_t    UINT32;
 typedef int64_t     INT64;
@@ -74,6 +80,47 @@ typedef intptr_t    LONG_PTR;
 typedef ULONG_PTR   SIZE_T;
 typedef LONG_PTR    SSIZE_T;
 typedef SIZE_T*     PSIZE_T;
+
+typedef struct _COORD {
+    SHORT X;
+    SHORT Y;
+} COORD;
+
+typedef struct _FILETIME {
+    DWORD dwLowDateTime;
+    DWORD dwHighDateTime;
+} FILETIME;
+
+typedef struct _SYSTEMTIME {
+    WORD wYear;
+    WORD wMonth;
+    WORD wDayOfWeek;
+    WORD wDay;
+    WORD wHour;
+    WORD wMinute;
+    WORD wSecond;
+    WORD wMilliseconds;
+} SYSTEMTIME;
+
+typedef struct _SRWLOCK {
+    PVOID Ptr;
+} SRWLOCK;
+
+typedef struct _RTL_CRITICAL_SECTION {
+    PVOID DebugInfo;
+    LONG LockCount;
+    LONG RecursionCount;
+    HANDLE OwningThread;
+    HANDLE LockSemaphore;
+    ULONG_PTR SpinCount;
+} RTL_CRITICAL_SECTION;
+
+typedef struct _CONTEXT {
+    ULONG_PTR Rax, Rbx, Rcx, Rdx, Rsi, Rdi, Rbp, Rsp;
+    ULONG_PTR R8, R9, R10, R11, R12, R13, R14, R15;
+    ULONG_PTR Rip;
+    ULONG_PTR RFlags;
+} CONTEXT;
 
 typedef unsigned short WCHAR;
 typedef WCHAR* BSTR;

@@ -16,27 +16,17 @@
 
 #include "ntll.h"
 
+/* ms_abi wrappers for setjmp/longjmp — bypass trampolines */
+extern int  ms_setjmp(void* j) __attribute__((ms_abi));
+extern void ms_longjmp(void* j, int v) __attribute__((ms_abi, noreturn));
+
 static const char* g_system_root = "/var/lib/lsw/root";
 static pthread_mutex_t g_pe_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static inline DWORD rva_to_offset(const IMAGE_NT_HEADERS64* nt, const IMAGE_SECTION_HEADER* sections,
-                                  DWORD rva) {
-    DWORD i;
-    if (!nt || !sections) return 0;
-    for (i = 0; i < nt->FileHeader.NumberOfSections; i++) {
-        DWORD va = sections[i].VirtualAddress;
-        DWORD vs = sections[i].Misc.VirtualSize;
-        if (rva >= va && rva < va + vs) {
-            return rva - va + sections[i].PointerToRawData;
-        }
-    }
-    return rva;
-}
-
 static inline void* rva_to_ptr(PNTLL_MODULE mod, DWORD rva) {
-    if (rva == 0) return NULL;
-    DWORD off = rva_to_offset(mod->nt_headers, mod->sections, rva);
-    return (BYTE*)mod->base_address + off;
+    // Sections are mapped at their virtual addresses (base_address + va),
+    // so an RVA resolves to the same image-relative offset in memory.
+    return rva ? (BYTE*)mod->base_address + rva : NULL;
 }
 
 // Read file into memory
@@ -82,9 +72,12 @@ static NTSTATUS map_sections(PNTLL_MODULE mod, const unsigned char* file_data,
     DWORD i;
     DWORD section_count = nt->FileHeader.NumberOfSections;
     DWORD header_size = nt->OptionalHeader.SizeOfHeaders;
+    size_t image_size = nt->OptionalHeader.SizeOfImage;
+    long page = (long)sysconf(_SC_PAGESIZE);
 
-    // Map headers
-    if (mprotect(image_base, header_size, PROT_READ) != 0)
+    // Map headers (copy first, then tighten protection below)
+    if (mprotect(image_base, (header_size + page - 1) & ~(page - 1),
+                 PROT_READ | PROT_WRITE) != 0)
         return STATUS_NO_MEMORY;
     memcpy(image_base, file_data, header_size);
 
@@ -94,28 +87,61 @@ static NTSTATUS map_sections(PNTLL_MODULE mod, const unsigned char* file_data,
         DWORD vs = sh->Misc.VirtualSize;
         DWORD raw = sh->PointerToRawData;
         DWORD raw_size = sh->SizeOfRawData;
+        DWORD padding = 0;
+
+        if (vs == 0) vs = raw_size;
+        vs = (vs + page - 1) & ~(page - 1);
+        if ((size_t)va + vs > image_size) vs = (DWORD)(image_size - (size_t)va);
+
+        // Write data into the section with full access first
+        if (mprotect((BYTE*)image_base + va, vs, PROT_READ | PROT_WRITE) != 0)
+            return STATUS_NO_MEMORY;
+        if (raw_size && raw > 0) {
+            memcpy((BYTE*)image_base + va, file_data + raw, raw_size);
+            padding = (sh->Misc.VirtualSize > raw_size && sh->Misc.VirtualSize <= vs)
+                          ? (sh->Misc.VirtualSize - raw_size) : 0;
+        } else {
+            padding = vs;
+        }
+        if (padding > 0)
+            memset((BYTE*)image_base + va + (raw_size ? raw_size : 0), 0, padding);
+    }
+
+    // Tighten protections to match section characteristics
+    DWORD iat_rva = 0, iat_size = 0;
+    {
+        IMAGE_DATA_DIRECTORY* iat = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+        iat_rva = iat->VirtualAddress;
+        iat_size = iat->Size;
+    }
+    for (i = 0; i < section_count; i++) {
+        const IMAGE_SECTION_HEADER* sh = &mod->sections[i];
+        DWORD va = sh->VirtualAddress;
+        DWORD vs = sh->Misc.VirtualSize;
+        DWORD raw_size = sh->SizeOfRawData;
         int prot = PROT_NONE;
+
+        if (vs == 0) vs = raw_size;
+        vs = (vs + page - 1) & ~(page - 1);
+        if ((size_t)va + vs > image_size) vs = (DWORD)(image_size - (size_t)va);
 
         DWORD flags = sh->Characteristics;
         if (flags & IMAGE_SCN_MEM_EXECUTE) prot |= PROT_EXEC;
         if (flags & IMAGE_SCN_MEM_READ) prot |= PROT_READ;
         if (flags & IMAGE_SCN_MEM_WRITE) prot |= PROT_WRITE;
 
-        // Some sections have no raw data (e.g., .bss)
-        size_t backing = raw_size ? raw_size : vs;
+        // The import address table gets patched at load time, so its backing
+        // section must stay writable even if the image marks it read-only.
+        if (iat_rva && iat_size &&
+            ((iat_rva >= va && iat_rva < va + vs) ||
+             (iat_rva < va && iat_rva + iat_size > va)))
+            prot |= PROT_WRITE;
 
-        if (mprotect((BYTE*)image_base + va, backing, prot) != 0) {
-            perror("mprotect");
-            return STATUS_NO_MEMORY;
-        }
-        if (raw_size && raw > 0) {
-            memcpy((BYTE*)image_base + va, file_data + raw, raw_size);
-        }
-        if (vs > raw_size) {
-            // Zero-fill the remainder (uninitialized data)
-            memset((BYTE*)image_base + va + raw_size, 0, vs - raw_size);
-        }
+        mprotect((BYTE*)image_base + va, vs, prot);
     }
+
+    // Lock the headers down to read-only
+    mprotect(image_base, (header_size + page - 1) & ~(page - 1), PROT_READ);
     return STATUS_SUCCESS;
 }
 
@@ -181,12 +207,12 @@ PNTLL_MODULE pe_load(const char* path) {
     mod->base_address = image_base;
     mod->size_of_image = nt->OptionalHeader.SizeOfImage;
     mod->entry_point = (void*)((BYTE*)image_base + nt->OptionalHeader.AddressOfEntryPoint);
-    mod->nt_headers = (IMAGE_NT_HEADERS64*)image_base;
-    mod->sections = (IMAGE_SECTION_HEADER*)((BYTE*)image_base +
-                     nt->FileHeader.SizeOfOptionalHeader + offsetof(IMAGE_NT_HEADERS64, FileHeader)
-                        + sizeof(IMAGE_FILE_HEADER));
+    mod->nt_headers = (IMAGE_NT_HEADERS64*)((BYTE*)image_base + dos->e_lfanew);
+    mod->sections = (IMAGE_SECTION_HEADER*)((BYTE*)mod->nt_headers +
+                     sizeof(IMAGE_NT_HEADERS64));
 
     NTSTATUS st = map_sections(mod, file_data, nt, image_base);
+    uintptr_t preferred_base = (uintptr_t)nt->OptionalHeader.ImageBase;
     free(file_data);
     if (!NT_SUCCESS(st)) {
         munmap(image_base, mod->size_of_image);
@@ -196,7 +222,7 @@ PNTLL_MODULE pe_load(const char* path) {
 
     // Apply relocations
     pthread_mutex_lock(&g_pe_lock);
-    intptr_t delta = (intptr_t)mod->base_address - (intptr_t)nt->OptionalHeader.ImageBase;
+    intptr_t delta = (intptr_t)mod->base_address - (intptr_t)preferred_base;
     if (delta != 0) {
         pe_relocate(mod, delta);
     }
@@ -366,6 +392,13 @@ NTSTATUS pe_resolve_imports(PNTLL_MODULE module) {
                 IMAGE_IMPORT_BY_NAME* iin = (IMAGE_IMPORT_BY_NAME*)((BYTE*)module->base_address + (DWORD)val);
                 if (iin) {
                     api = ntll_dispatch(dep, (const char*)iin->Name);
+                    /* Bypass trampoline for setjmp/longjmp: the trampoline
+                       frame breaks longjmp's context restore. */
+                    const char* nm = (const char*)iin->Name;
+                    if (strcmp(nm, "__intrinsic_setjmp") == 0)
+                        api = (void*)ms_setjmp;
+                    else if (strcmp(nm, "longjmp") == 0)
+                        api = (void*)ms_longjmp;
                 }
             }
             first[idx].u1.Function = (UINT64)(uintptr_t)api;

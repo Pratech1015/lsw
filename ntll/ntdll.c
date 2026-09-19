@@ -19,24 +19,14 @@ BOOL RtlFreeHeap(HANDLE heap, DWORD flags, void* mem) {
     return TRUE;
 }
 
-HANDLE GetProcessHeap(void) {
-    static HANDLE heap = (HANDLE)0x100;
-    return heap;
-}
-
-void* LocalAlloc(DWORD flags, SIZE_T size) {
-    (void)flags;
-    return malloc(size);
-}
-
-void* LocalFree(void* mem) {
-    free(mem);
-    return NULL;
-}
-
 void* LocalAllocEx(void* heap, DWORD flags, SIZE_T size) {
     (void)heap; (void)flags;
     return malloc(size);
+}
+
+LONG RtlDisownModuleHeapAllocation(HANDLE heap, void* address) {
+    (void)heap; (void)address;
+    return 0; /* STATUS_SUCCESS */
 }
 
 // Character classification helpers used by CRT str... functions
@@ -64,10 +54,6 @@ int RtlCompareMemory(const void* a, const void* b, SIZE_T len) {
 
 void RtlFillMemory(void* dest, SIZE_T len, BYTE fill) {
     memset(dest, fill, len);
-}
-
-HANDLE GetCurrentProcess(void) {
-    return (HANDLE)(uintptr_t)win32_get_current_process_id();
 }
 
 HANDLE GetCurrentThread(void) {
@@ -114,4 +100,179 @@ void ntll_hexdump(const void* data, size_t len) {
         if (i % 16 == 15) fprintf(stderr, "\n");
     }
     if (len % 16) fprintf(stderr, "\n");
+}// ntdll extensions — Nt*/Rtl* for real cmd.exe support
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <wchar.h>
+#include <pthread.h>
+
+#include "ntll.h"
+
+// ── Nt* syscalls ───────────────────────────────────────────────
+
+NTSTATUS NtCancelSynchronousIoFile(HANDLE h, void* apc, void* iosb) {
+    (void)h; (void)apc;
+    if (iosb) memset(iosb, 0, sizeof(IO_STATUS_BLOCK));
+    return 0xC0000004;  // STATUS_NOT_SUPPORTED
 }
+
+NTSTATUS NtFsControlFile(HANDLE h, void* ev, void* apc, void* iosb,
+                         DWORD ctrl, void* in, DWORD insz, void* out, DWORD outsz) {
+    (void)h; (void)ev; (void)apc; (void)ctrl;
+    (void)in; (void)insz; (void)out; (void)outsz;
+    if (iosb) memset(iosb, 0, sizeof(IO_STATUS_BLOCK));
+    return 0xC0000004;
+}
+
+NTSTATUS NtOpenFile(PHANDLE handle, DWORD access, void* obj, void* iosb,
+                    DWORD sharing, DWORD attrs) {
+    (void)access; (void)obj; (void)sharing; (void)attrs;
+    if (iosb) memset(iosb, 0, sizeof(IO_STATUS_BLOCK));
+    *handle = (HANDLE)(uintptr_t)-1;
+    return 0xC0000004;
+}
+
+NTSTATUS NtOpenProcessToken(HANDLE proc, DWORD access, PHANDLE tok) {
+    (void)proc; (void)access;
+    static int fake_token = 0;
+    *tok = (HANDLE)&fake_token;
+    return 0;
+}
+
+NTSTATUS NtOpenThreadToken(HANDLE thread, DWORD access, BOOL self, PHANDLE tok) {
+    (void)thread; (void)access; (void)self;
+    static int fake_token2 = 0;
+    *tok = (HANDLE)&fake_token2;
+    return 0;
+}
+
+NTSTATUS NtQueryInformationToken(HANDLE tok, int cls, void* buf,
+                                 DWORD len, DWORD* retlen) {
+    (void)tok; (void)cls;
+    if (buf && len >= 4) memset(buf, 0, len);
+    if (retlen) *retlen = 4;
+    return 0;
+}
+
+NTSTATUS NtQueryVolumeInformationFile(HANDLE h, void* iosb, void* info,
+                                      DWORD len, int cls) {
+    (void)h; (void)cls;
+    if (iosb) memset(iosb, 0, sizeof(IO_STATUS_BLOCK));
+    if (info && len >= 16) memset(info, 0, len);
+    return 0;
+}
+
+NTSTATUS NtSetInformationFile(HANDLE h, void* iosb, void* info,
+                              DWORD len, int cls) {
+    (void)h; (void)info; (void)len; (void)cls;
+    if (iosb) memset(iosb, 0, sizeof(IO_STATUS_BLOCK));
+    return 0;
+}
+
+NTSTATUS NtSetInformationProcess(HANDLE h, int cls, void* info, DWORD len) {
+    (void)h; (void)cls; (void)info; (void)len;
+    return 0;
+}
+
+NTSTATUS NtQueryInformationProcess(HANDLE h, int cls, void* buf,
+                                   DWORD len, DWORD* retlen) {
+    (void)h; (void)cls;
+    if (buf && len >= 4) memset(buf, 0, len);
+    if (retlen) *retlen = 4;
+    return 0;
+}
+
+// ── Rtl* helpers ───────────────────────────────────────────────
+
+void RtlCaptureContext(CONTEXT* ctx) {
+    if (ctx) memset(ctx, 0, sizeof(CONTEXT));
+}
+
+void RtlVirtualUnwind(DWORD type, ULONGLONG base, ULONGLONG pc,
+                      void* ctx) {
+    (void)type; (void)base; (void)pc; (void)ctx;
+}
+
+void* RtlLookupFunctionEntry(ULONGLONG pc, ULONGLONG* base, void* unwind) {
+    (void)pc; (void)base; (void)unwind;
+    return NULL;
+}
+
+DWORD64 RtlFindLeastSignificantBit(ULONGLONG v) {
+    if (v == 0) return 64;
+    DWORD64 r = 0;
+    while ((v & 1) == 0) { v >>= 1; r++; }
+    return r;
+}
+
+ULONG RtlNtStatusToDosError(NTSTATUS st) {
+    if ((int)st >= 0) return (ULONG)st;
+    return 1;  // ERROR_INVALID_FUNCTION
+}
+
+void RtlCreateUnicodeStringFromAsciiz(void* dst, const char* src) {
+    UNICODE_STRING* us = (UNICODE_STRING*)dst;
+    if (!src) { us->Length = 0; us->Buffer = NULL; return; }
+    size_t len = strlen(src);
+    us->Buffer = (wchar_t*)calloc(len + 1, sizeof(wchar_t));
+    mbstowcs(us->Buffer, src, len);
+    us->Length = (USHORT)(len * sizeof(wchar_t));
+    us->MaximumLength = (USHORT)((len + 1) * sizeof(wchar_t));
+}
+
+NTSTATUS RtlDosPathNameToNtPathName_U(const wchar_t* dos, void* nt,
+                                       void* part, void* rel) {
+    (void)part; (void)rel;
+    // Minimal: just copy the path as-is (forward slash)
+    UNICODE_STRING* us = (UNICODE_STRING*)nt;
+    if (!dos) { us->Length = 0; us->Buffer = NULL; return 0; }
+    size_t len = wcslen(dos);
+    us->Buffer = (wchar_t*)calloc(len + 1, sizeof(wchar_t));
+    wcscpy(us->Buffer, dos);
+    us->Length = (USHORT)(len * sizeof(wchar_t));
+    us->MaximumLength = (USHORT)((len + 1) * sizeof(wchar_t));
+    return 0;
+}
+
+NTSTATUS RtlDosPathNameToRelativeNtPathName_U_WithStatus(const wchar_t* dos,
+                                                          void* nt,
+                                                          void* part, void* rel) {
+    return RtlDosPathNameToNtPathName_U(dos, nt, part, rel);
+}
+
+void RtlFreeUnicodeString(void* us_ptr) {
+    UNICODE_STRING* us = (UNICODE_STRING*)us_ptr;
+    if (us && us->Buffer) { free(us->Buffer); us->Buffer = NULL; }
+}
+
+void RtlReleaseRelativeName(void* rel) { (void)rel; }
+
+// Feature configuration (stub - not supported)
+typedef struct _FEATURE_CONFIGURATION { ULONG dummy; } FEATURE_CONFIGURATION;
+typedef struct _FEATURE_CONFIGURATION_CHANGE_REGISTRATION { ULONG dummy; } FEATURE_CONFIGURATION_CHANGE_REGISTRATION;
+
+NTSTATUS RtlRegisterFeatureConfigurationChangeNotification(
+    const FEATURE_CONFIGURATION_CHANGE_REGISTRATION* reg, void* token, void* callback, void* context, uint64_t* handle) {
+    (void)reg; (void)token; (void)callback; (void)context;
+    if (handle) *handle = 0;
+    return 0;
+}
+
+NTSTATUS RtlQueryFeatureConfiguration(
+    ULONG sub_group_count, void* sub_group, ULONG feature_count, void* features, ULONG* return_count) {
+    (void)sub_group_count; (void)sub_group; (void)feature_count; (void)features;
+    if (return_count) *return_count = 0;
+    return 0;
+}
+
+BOOL RtlDllShutdownInProgress(void) { return FALSE; }
+
+// WIL (Windows Implementation Libraries) error notification stub
+void WilFailureNotifyWatchers(void* params) { (void)params; }
+void LogStagedFeatureUsage(void* a, void* b, void* c) { (void)a; (void)b; (void)c; }

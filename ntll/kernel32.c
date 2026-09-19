@@ -18,6 +18,9 @@
 
 #include "ntll.h"
 
+extern wchar_t g_cmdline[4096];
+extern void* g_procparams;
+
 #define WINDOWS_TICK ((uint64_t)10000000)
 #define SEC_TO_UNIX_EPOCH ((uint64_t)11644473600LL)
 #define ERROR_FILE_NOT_FOUND 0x02
@@ -56,7 +59,7 @@ static void handle_table_init(void) {
     for (int i = 0; i < MAX_WIN_HANDLES; i++) g_handle_table[i] = -1;
 }
 
-static HANDLE handle_alloc(int linux_fd) {
+HANDLE win32_handle_alloc(int linux_fd) {
     pthread_mutex_lock(&g_handle_lock);
     for (int i = 0; i < MAX_WIN_HANDLES; i++) {
         if (g_handle_table[i] == -1) {
@@ -192,7 +195,7 @@ HANDLE win32_create_file(const char* path, DWORD access, DWORD share,
         win32_set_last_error(errno_to_win32(errno));
         return (HANDLE)INVALID_HANDLE_VALUE;
     }
-    return handle_alloc(fd);
+    return win32_handle_alloc(fd);
 }
 
 BOOL win32_read_file(HANDLE handle, void* buf, DWORD len, DWORD* bytes_read,
@@ -200,10 +203,12 @@ BOOL win32_read_file(HANDLE handle, void* buf, DWORD len, DWORD* bytes_read,
     (void)overlapped;
     ensure_handles();
     int fd = handle_lookup(handle);
+    fprintf(stderr, "[trace] ReadFile handle=%p fd=%d len=%u\n", (void*)(uintptr_t)handle, fd, len);
     if (fd < 0) { win32_set_last_error(6); return FALSE; }
     ssize_t n = read(fd, buf, len);
     if (n < 0) { win32_set_last_error(errno_to_win32(errno)); return FALSE; }
     if (bytes_read) *bytes_read = (DWORD)n;
+    fprintf(stderr, "[trace] ReadFile got %zd bytes\n", n);
     return TRUE;
 }
 
@@ -212,6 +217,7 @@ BOOL win32_write_file(HANDLE handle, void* buf, DWORD len, DWORD* written,
     (void)overlapped;
     ensure_handles();
     int fd = handle_lookup(handle);
+    fprintf(stderr, "[dbg] WriteFile handle=%p fd=%d len=%u\n", (void*)(uintptr_t)handle, fd, len);
     if (fd < 0) { win32_set_last_error(6); return FALSE; }
     ssize_t n = write(fd, buf, len);
     if (n < 0) { win32_set_last_error(errno_to_win32(errno)); return FALSE; }
@@ -444,13 +450,26 @@ BOOL win32_read_console_input(HANDLE c, void* recs, DWORD count, DWORD* read) {
 BOOL win32_write_console(HANDLE c, void* buf, DWORD len,
                         DWORD* written, void* reserved) {
     (void)c; (void)reserved;
-    fwrite(buf, 1, len, stdout);
+    fprintf(stderr, "[trace] WriteConsoleW handle=%p len=%u\n", (void*)(uintptr_t)c, len);
+    const uint16_t* wbuf = (const uint16_t*)buf;
+    for (DWORD i = 0; i < len; i++) {
+        uint16_t ch = wbuf[i];
+        if (ch < 0x80) {
+            fputc((char)ch, stdout);
+        } else {
+            wchar_t wc = (wchar_t)ch;
+            char mb[4];
+            int n = wctomb(mb, wc);
+            if (n > 0) fwrite(mb, 1, n, stdout);
+        }
+    }
     fflush(stdout);
     if (written) *written = len;
     return TRUE;
 }
 BOOL win32_set_console_mode(HANDLE c, DWORD mode) { (void)c; (void)mode; return TRUE; }
 BOOL win32_get_console_mode(HANDLE c, DWORD* mode) {
+    fprintf(stderr, "[trace] GetConsoleMode(%p)\n", (void*)(uintptr_t)c);
     (void)c; if (mode) *mode = 7; return TRUE;
 }
 BOOL win32_get_console_screen_buffer_info(HANDLE c, void* info) {
@@ -716,4 +735,991 @@ DWORD win32_get_module_handle(const char* name) {
 void* win32_get_proc_address(HMODULE h, const char* name) {
     (void)h;
     return ntll_dispatch(NULL, name);
+}// kernel32 extensions — appended for real cmd.exe support
+
+// ── Heap ───────────────────────────────────────────────────────
+
+static HANDLE g_process_heap = (HANDLE)1;
+
+HANDLE GetProcessHeap(void) {
+    if (!g_process_heap) {
+        g_process_heap = (HANDLE)1;  // sentinel
+    }
+    return g_process_heap;
+}
+
+void* HeapAlloc(HANDLE heap, DWORD flags, SIZE_T size) {
+    (void)heap; (void)flags;
+    return calloc(1, size);
+}
+
+BOOL HeapFree(HANDLE heap, DWORD flags, void* p) {
+    (void)heap; (void)flags;
+    free(p);
+    return TRUE;
+}
+
+void* HeapReAlloc(HANDLE heap, DWORD flags, void* p, SIZE_T size) {
+    (void)heap; (void)flags;
+    return realloc(p, size);
+}
+
+SIZE_T HeapSize(HANDLE heap, DWORD flags, void* p) {
+    (void)heap; (void)flags; (void)p;
+    return 0;
+}
+
+BOOL HeapSetInformation(HANDLE h, int cls, void* info, SIZE_T len) {
+    (void)h; (void)cls; (void)info; (void)len;
+    return TRUE;
+}
+
+void* GlobalAlloc(UINT flags, SIZE_T size) { (void)flags; return calloc(1, size); }
+void* GlobalFree(void* p) { free(p); return NULL; }
+void* LocalAlloc(UINT flags, SIZE_T size) { (void)flags; return calloc(1, size); }
+void* LocalFree(void* p) { free(p); return NULL; }
+
+// ── Virtual memory ─────────────────────────────────────────────
+
+void* VirtualAlloc(void* addr, SIZE_T size, DWORD type, DWORD protect) {
+    (void)addr; (void)type; (void)protect;
+    return calloc(1, size);
+}
+
+BOOL VirtualFree(void* addr, SIZE_T size, DWORD type) {
+    (void)size; (void)type;
+    free(addr);
+    return TRUE;
+}
+
+BOOL VirtualQuery(void* addr, void* buf, SIZE_T len) {
+    (void)addr;
+    if (len >= 48) memset(buf, 0, len);
+    return TRUE;
+}
+
+// ── SRW Locks ──────────────────────────────────────────────────
+
+void AcquireSRWLockExclusive(SRWLOCK* l) { pthread_mutex_lock((pthread_mutex_t*)l); }
+void AcquireSRWLockShared(SRWLOCK* l) { pthread_mutex_lock((pthread_mutex_t*)l); }
+void ReleaseSRWLockExclusive(SRWLOCK* l) { pthread_mutex_unlock((pthread_mutex_t*)l); }
+void ReleaseSRWLockShared(SRWLOCK* l) { pthread_mutex_unlock((pthread_mutex_t*)l); }
+BOOL TryAcquireSRWLockExclusive(SRWLOCK* l) {
+    return pthread_mutex_trylock((pthread_mutex_t*)l) == 0;
+}
+
+// ── Critical section (Ex variant) ─────────────────────────────
+
+BOOL InitializeCriticalSectionEx(void* cs, DWORD spin, DWORD flags) {
+    (void)spin; (void)flags;
+    win32_initialize_critical_section(cs);
+    return TRUE;
+}
+
+// ── Single-list / InitOnce ─────────────────────────────────────
+
+#include <stdatomic.h>
+
+void InitializeSListHead(void* head) { memset(head, 0, 64); }
+
+/* Simple InitOnce implementation: state is in the INIT_ONCE value (0/1/2).
+ * Context pointers are stored in a small static table. */
+#define ONCE_TABLE_SIZE 32
+static struct { void* once; void* ctx; } g_once_table[ONCE_TABLE_SIZE];
+static int g_once_count = 0;
+
+static void once_store_ctx(void* once, void* ctx) {
+    for (int i = 0; i < g_once_count; i++) {
+        if (g_once_table[i].once == once) { g_once_table[i].ctx = ctx; return; }
+    }
+    if (g_once_count < ONCE_TABLE_SIZE) {
+        g_once_table[g_once_count].once = once;
+        g_once_table[g_once_count].ctx = ctx;
+        g_once_count++;
+    }
+}
+static void* once_get_ctx(void* once) {
+    for (int i = 0; i < g_once_count; i++) {
+        if (g_once_table[i].once == once) return g_once_table[i].ctx;
+    }
+    return NULL;
+}
+
+BOOL InitOnceBeginInitialize(void* once, DWORD flags, BOOL* pending, void** ctx) {
+    if (!once || !pending) return FALSE;
+    volatile LONG* state = (volatile LONG*)once;
+    LONG cur = *state;
+    (void)flags;
+    if (cur == 0) {
+        *state = 1;
+        *pending = TRUE;
+        if (ctx) *ctx = NULL;
+    } else if (cur == 1) {
+        *pending = TRUE;
+        if (ctx) *ctx = NULL;
+    } else {
+        *pending = FALSE;
+        if (ctx) *ctx = once_get_ctx(once);
+    }
+    return TRUE;
+}
+BOOL InitOnceComplete(void* once, DWORD flags, void* ctx) {
+    if (!once) return FALSE;
+    volatile LONG* state = (volatile LONG*)once;
+    (void)flags;
+    once_store_ctx(once, ctx);
+    *state = 2;
+    return TRUE;
+}
+
+// ── Process ────────────────────────────────────────────────────
+
+HANDLE GetCurrentProcess(void) { return (HANDLE)(uintptr_t)-1; }
+
+BOOL CreateProcessW(const void* app, void* cmd, void* pa, void* ta,
+                    BOOL inherit, DWORD flags, void* env, void* cwd,
+                    void* si, void* pi) {
+    (void)app; (void)cmd; (void)pa; (void)ta; (void)inherit;
+    (void)flags; (void)env; (void)cwd; (void)si; (void)pi;
+    return FALSE;
+}
+
+BOOL CreateProcessAsUserW(HANDLE tok, const void* app, void* cmd,
+                          void* pa, void* ta, BOOL inherit, DWORD flags,
+                          void* env, void* cwd, void* si, void* pi) {
+    (void)tok; (void)app; (void)cmd; (void)pa; (void)ta;
+    (void)inherit; (void)flags; (void)env; (void)cwd; (void)si; (void)pi;
+    return FALSE;
+}
+
+BOOL TerminateProcess(HANDLE h, UINT code) {
+    (void)h; (void)code;
+    win32_exit_process(code);
+    return TRUE;
+}
+
+DWORD GetModuleFileNameA(HMODULE mod, char* buf, DWORD sz) {
+    const char* path = getenv("LSW_MODULE_PATH");
+    if (!path) path = "C:\\Windows\\System32\\cmd.exe";
+    if (buf && sz > 0) {
+        size_t n = strlen(path);
+        if (n >= sz) n = sz - 1;
+        memcpy(buf, path, n);
+        buf[n] = '\0';
+    }
+    return strlen(path);
+}
+
+DWORD GetModuleFileNameW(HMODULE mod, wchar_t* buf, DWORD sz) {
+    (void)mod;
+    const char* path = getenv("LSW_MODULE_PATH");
+    if (!path) path = "C:\\Windows\\System32\\cmd.exe";
+    if (buf && sz > 0) {
+        size_t n = mbstowcs(buf, path, sz);
+        if (n == (size_t)-1) { buf[0] = L'\0'; return 0; }
+        if (n >= sz) n = sz - 1;
+        buf[n] = L'\0';
+    }
+    return strlen(path);
+}
+
+BOOL GetModuleHandleExW(DWORD flags, const wchar_t* name, HMODULE* mod) {
+    (void)flags; (void)name;
+    *mod = (HMODULE)1;
+    return TRUE;
+}
+
+HMODULE LoadLibraryExW(const wchar_t* name, HANDLE file, DWORD flags) {
+    (void)file; (void)flags;
+    return (HMODULE)(name ? (uintptr_t)win32_get_module_handle("") : 1);
+}
+
+DWORD GetVersion(void) { return 0x00000A28; }  // 10.0
+
+HANDLE OpenThread(DWORD access, BOOL inherit, DWORD tid) {
+    (void)access; (void)inherit; (void)tid;
+    return (HANDLE)(uintptr_t)tid;
+}
+
+BOOL GetThreadGroupAffinity(void* h, void* affinity) {
+    (void)h;
+    if (affinity) memset(affinity, 0, 16);
+    return TRUE;
+}
+
+// ── Threadpool ─────────────────────────────────────────────────
+
+void CreateThreadpoolTimer(void** cb, void* env, void* pool) {
+    (void)cb; (void)env; (void)pool;
+}
+void CloseThreadpoolTimer(void* cb) { (void)cb; }
+void SetThreadpoolTimer(void* cb, void* due, ULONG period, ULONG window) {
+    (void)cb; (void)due; (void)period; (void)window;
+}
+void WaitForThreadpoolTimerCallbacks(void* cb, BOOL cancel) {
+    (void)cb; (void)cancel;
+}
+
+// ── Proc thread attribute list ─────────────────────────────────
+
+BOOL InitializeProcThreadAttributeList(void* list, DWORD count, DWORD flags, SIZE_T* sz) {
+    (void)list; (void)count; (void)flags;
+    if (sz) *sz = 128;
+    return TRUE;
+}
+void DeleteProcThreadAttributeList(void* list) { (void)list; }
+BOOL UpdateProcThreadAttribute(void* list, DWORD flags, DWORD attr,
+                               void* val, SIZE_T sz, void* prev, void* csz) {
+    (void)list; (void)flags; (void)attr; (void)val;
+    (void)sz; (void)prev; (void)csz;
+    return TRUE;
+}
+
+// ── Misc process ───────────────────────────────────────────────
+
+BOOL ReadProcessMemory(HANDLE h, void* base, void* buf, SIZE_T sz, SIZE_T* rd) {
+    (void)h; (void)base; (void)buf; (void)sz;
+    if (rd) *rd = 0;
+    return FALSE;
+}
+
+void SetUnhandledExceptionFilter(void* f) { (void)f; }
+long UnhandledExceptionFilter(void* r) { (void)r; return 0; }
+UINT SetErrorMode(UINT mode) { (void)mode; return 0; }
+
+BOOL DuplicateHandle(HANDLE src, HANDLE hsrc, HANDLE dst, HANDLE* hdst,
+                     DWORD access, BOOL inherit, DWORD opts) {
+    (void)src; (void)hsrc; (void)dst; (void)access;
+    (void)inherit; (void)opts;
+    *hdst = hsrc;
+    return TRUE;
+}
+
+// ── Console ────────────────────────────────────────────────────
+
+static HANDLE g_std_handles[3] = {0};
+static int std_handles_initialized = 0;
+
+HANDLE GetStdHandle(DWORD n) {
+    /* Windows STD_INPUT_HANDLE = -10, STD_OUTPUT_HANDLE = -11, STD_ERROR_HANDLE = -12 */
+    int idx = -1;
+    if (n == (DWORD)-10) idx = 0;
+    else if (n == (DWORD)-11) idx = 1;
+    else if (n == (DWORD)-12) idx = 2;
+    else if (n < 3) idx = (int)n;
+    else return INVALID_HANDLE_VALUE;
+    if (!std_handles_initialized) {
+        ensure_handles();
+        g_std_handles[0] = win32_handle_alloc(STDIN_FILENO);
+        g_std_handles[1] = win32_handle_alloc(STDOUT_FILENO);
+        g_std_handles[2] = win32_handle_alloc(STDERR_FILENO);
+        std_handles_initialized = 1;
+    }
+    fprintf(stderr, "[trace] GetStdHandle(%u) = %p\n", n, (void*)(uintptr_t)g_std_handles[idx]);
+    return g_std_handles[idx];
+}
+
+void win32_init_peb_standard_handles(void) {
+    if (std_handles_initialized) return;
+    ensure_handles();
+    g_std_handles[0] = win32_handle_alloc(STDIN_FILENO);
+    g_std_handles[1] = win32_handle_alloc(STDOUT_FILENO);
+    g_std_handles[2] = win32_handle_alloc(STDERR_FILENO);
+    std_handles_initialized = 1;
+    if (g_procparams) {
+        /* ConsoleHandle = stdin handle, ConsoleFlags = 1 (attached console) */
+        uintptr_t* con = (uintptr_t*)((char*)g_procparams + 0x10);
+        uint32_t* conflags = (uint32_t*)((char*)g_procparams + 0x18);
+        *con = (uintptr_t)g_std_handles[0];
+        *conflags = 1;
+        uintptr_t* std_in  = (uintptr_t*)((char*)g_procparams + 0x20);
+        uintptr_t* std_out = (uintptr_t*)((char*)g_procparams + 0x28);
+        uintptr_t* std_err = (uintptr_t*)((char*)g_procparams + 0x30);
+        *std_in  = (uintptr_t)g_std_handles[0];
+        *std_out = (uintptr_t)g_std_handles[1];
+        *std_err = (uintptr_t)g_std_handles[2];
+        fprintf(stderr, "[trace] PEB ConsoleHandle=%p ConsoleFlags=%u stdin=%p stdout=%p stderr=%p\n",
+                (void*)*con, (unsigned)*conflags,
+                (void*)*std_in, (void*)*std_out, (void*)*std_err);
+    }
+}
+
+BOOL ReadConsoleW(HANDLE h, void* buf, DWORD toread, DWORD* read, void* sr) {
+    (void)h; (void)sr;
+    uint16_t* wbuf = (uint16_t*)buf;
+    DWORD count = 0;
+    if (toread > 0) {
+        while (count < toread) {
+            wint_t c = fgetwc(stdin);
+            if (c == WEOF) break;
+            wbuf[count++] = (uint16_t)c;
+            if (c == L'\n') break;
+        }
+    }
+    if (read) *read = count;
+    if (count > 0) {
+        fprintf(stderr, "[trace] ReadConsoleW toread=%u got %u chars U+%04X\n",
+                toread, count, (unsigned)wbuf[0]);
+        fprintf(stderr, "[trace]   hex:");
+        for (DWORD i = 0; i < count && i < 20; i++)
+            fprintf(stderr, " %04x", (unsigned)wbuf[i]);
+        fprintf(stderr, "\n");
+    } else
+        fprintf(stderr, "[trace] ReadConsoleW toread=%u EOF\n", toread);
+    return count > 0;
+}
+
+DWORD GetConsoleOutputCP(void) { return 65001; }
+HWND GetConsoleWindow(void) { return (HWND)(uintptr_t)0x1234; }
+
+BOOL SetConsoleCursorPosition(HANDLE h, DWORD pos) {
+    (void)h;
+    int x = pos & 0xFFFF;
+    int y = pos >> 16;
+    printf("\033[%d;%dH", y + 1, x + 1);
+    return TRUE;
+}
+
+BOOL ScrollConsoleScreenBufferW(HANDLE h, void* rect, void* clip, COORD dst, void* fill) {
+    (void)h; (void)rect; (void)clip; (void)dst; (void)fill;
+    return TRUE;
+}
+
+BOOL FlushConsoleInputBuffer(HANDLE h) { (void)h; return TRUE; }
+
+BOOL SetConsoleCtrlHandler(void* handler, BOOL add) {
+    (void)handler; (void)add;
+    return TRUE;
+}
+
+// ── File: Find* ────────────────────────────────────────────────
+
+typedef struct { DIR* d; char pattern[512]; char base[1024]; int first; } FIND_CTX;
+
+HANDLE FindFirstFileW(const wchar_t* pattern, void* data) {
+    if (!pattern || !data) return INVALID_HANDLE_VALUE;
+    char upath[2048];
+    wcstombs(upath, pattern, sizeof(upath));
+    // extract directory and pattern
+    char* sl = strrchr(upath, '/');
+    if (!sl) sl = strrchr(upath, '\\');
+    char dirpath[2048] = ".";
+    char match[512] = "*";
+    if (sl) {
+        size_t dlen = (size_t)(sl - upath);
+        if (dlen == 0) dlen = 1;
+        memcpy(dirpath, upath, dlen);
+        dirpath[dlen] = '\0';
+        snprintf(match, sizeof(match), "%s", sl + 1);
+    }
+    DIR* d = opendir(dirpath);
+    if (!d) return INVALID_HANDLE_VALUE;
+    FIND_CTX* ctx = calloc(1, sizeof(FIND_CTX));
+    ctx->d = d;
+    ctx->first = 1;
+    snprintf(ctx->pattern, sizeof(ctx->pattern), "%s", match);
+    snprintf(ctx->base, sizeof(ctx->base), "%s", dirpath);
+    memcpy(data, ctx, sizeof(FIND_CTX));
+    free(ctx);
+    ctx = (FIND_CTX*)data;
+    ctx->d = d;
+    ctx->first = 1;
+    // find first match
+    struct dirent* e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        // simple pattern match
+        if (strcmp(match, "*") == 0 || strstr(e->d_name, match)) {
+            wchar_t* wname = (wchar_t*)((char*)data + 44);
+            mbstowcs(wname, e->d_name, 260);
+            return (HANDLE)(uintptr_t)1;
+        }
+    }
+    closedir(d);
+    return INVALID_HANDLE_VALUE;
+}
+
+BOOL FindNextFileW(HANDLE h, void* data) {
+    (void)h;
+    FIND_CTX* ctx = (FIND_CTX*)data;
+    if (!ctx || !ctx->d) return FALSE;
+    struct dirent* e;
+    while ((e = readdir(ctx->d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        wchar_t* wname = (wchar_t*)((char*)data + 44);
+        mbstowcs(wname, e->d_name, 260);
+        return TRUE;
+    }
+    closedir(ctx->d);
+    ctx->d = NULL;
+    return FALSE;
+}
+
+BOOL FindClose(HANDLE h) { (void)h; return TRUE; }
+BOOL FindFirstFileExW(const wchar_t* a, int b, void* c) { return FindFirstFileW(a, c); }
+BOOL FindFirstStreamWStub(const wchar_t* a, int b, void* c, DWORD d) {
+    (void)a; (void)b; (void)c; (void)d; return FALSE;
+}
+BOOL FindNextStreamWStub(HANDLE a, void* b) { (void)a; (void)b; return FALSE; }
+
+// ── File: attributes / info ────────────────────────────────────
+
+#define FILE_TYPE_UNKNOWN       0x0000
+#define FILE_TYPE_DISK          0x0001
+#define FILE_TYPE_CHAR          0x0002
+#define FILE_TYPE_PIPE          0x0003
+#define FILE_TYPE_REMOTE        0x8000
+#define FILE_ATTRIBUTE_READONLY  0x0001
+#define FILE_ATTRIBUTE_HIDDEN    0x0002
+#define FILE_ATTRIBUTE_DIRECTORY 0x0010
+#define FILE_ATTRIBUTE_NORMAL    0x0080
+
+// CRT standard fds 0/1/2 map directly to Linux stdin/stdout/stderr; the
+// console emulation presents them as the process console (FILE_TYPE_CHAR).
+DWORD GetFileType(HANDLE h) {
+    uintptr_t hval = (uintptr_t)h;
+    if (hval < 3) return FILE_TYPE_CHAR;
+    ensure_handles();
+    int fd = handle_lookup(h);
+    if (fd < 0) {
+        win32_set_last_error(6);
+        return FILE_TYPE_UNKNOWN;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        win32_set_last_error(errno_to_win32(errno));
+        return FILE_TYPE_UNKNOWN;
+    }
+    if (S_ISFIFO(st.st_mode)) return FILE_TYPE_PIPE;
+    if (S_ISCHR(st.st_mode)) return FILE_TYPE_CHAR;
+    return FILE_TYPE_DISK;
+}
+
+BOOL GetFileInformationByHandleEx(HANDLE h, int cls, void* buf, DWORD sz) {
+    (void)h; (void)cls; (void)sz;
+    memset(buf, 0, 48);
+    return TRUE;
+}
+
+BOOL GetFileAttributesExW(const wchar_t* p, int cls, void* data) {
+    (void)cls;
+    if (!p || !data) return FALSE;
+    char upath[2048];
+    wcstombs(upath, p, sizeof(upath));
+    struct stat st;
+    if (stat(upath, &st) != 0) return FALSE;
+    memset(data, 0, 40);
+    ((DWORD*)data)[0] = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+    return TRUE;
+}
+
+BOOL GetFileSecurityW(const wchar_t* p, DWORD cls, void* sd, DWORD sz, DWORD* needed) {
+    (void)p; (void)cls; (void)sz;
+    if (sd) memset(sd, 0, 64);
+    if (needed) *needed = 64;
+    return TRUE;
+}
+
+DWORD SearchPathW(const wchar_t* dir, const wchar_t* file, const wchar_t* ext,
+                  DWORD bufsz, wchar_t* buf, wchar_t** fpart) {
+    (void)dir; (void)ext; (void)bufsz; (void)fpart;
+    if (!buf) return 0;
+    if (file) {
+        wcscpy(buf, file);
+        if (fpart) *fpart = buf;
+        return (DWORD)wcslen(buf);
+    }
+    return 0;
+}
+
+BOOL GetVolumeInformationW(const wchar_t* root, wchar_t* label, DWORD lsz,
+                           DWORD* serial, DWORD* maxcomp, DWORD* flags,
+                           wchar_t* fsname, DWORD fsnsz) {
+    (void)root; (void)serial; (void)maxcomp; (void)flags;
+    if (label && lsz > 0) label[0] = L'\0';
+    if (fsname && fsnsz > 0) wcscpy(fsname, L"NTFS");
+    return TRUE;
+}
+
+BOOL GetVolumePathNameW(const wchar_t* file, wchar_t* vol, DWORD sz) {
+    (void)file;
+    if (vol && sz > 0) wcscpy(vol, L"C:\\");
+    return TRUE;
+}
+
+DWORD GetDriveTypeW(const wchar_t* root) {
+    (void)root;
+    return 3;  // DRIVE_FIXED
+}
+
+BOOL GetDiskFreeSpaceExW(const wchar_t* dir, unsigned long long* avail,
+                         unsigned long long* total, unsigned long long* free) {
+    (void)dir;
+    if (avail) *avail = 100ULL * 1024 * 1024 * 1024;
+    if (total) *total = 256ULL * 1024 * 1024 * 1024;
+    if (free) *free = 100ULL * 1024 * 1024 * 1024;
+    return TRUE;
+}
+
+BOOL SetEndOfFile(HANDLE h) { (void)h; return TRUE; }
+
+BOOL SetFileTime(HANDLE h, void* c, void* a, void* w) {
+    (void)h; (void)c; (void)a; (void)w;
+    return TRUE;
+}
+
+// ── File: link / move ──────────────────────────────────────────
+
+BOOL MoveFileExW(const wchar_t* a, const wchar_t* b, DWORD flags) {
+    (void)flags;
+    char ua[2048], ub[2048];
+    wcstombs(ua, a, sizeof(ua));
+    wcstombs(ub, b, sizeof(ub));
+    return rename(ua, ub) == 0;
+}
+
+BOOL MoveFileWithProgressW(const wchar_t* a, const wchar_t* b, void* prog, void* data, DWORD flags) {
+    (void)prog; (void)data;
+    return MoveFileExW(a, b, flags);
+}
+
+BOOL CopyFileW(const wchar_t* a, const wchar_t* b, BOOL fail) {
+    (void)fail;
+    char ua[2048], ub[2048];
+    wcstombs(ua, a, sizeof(ua));
+    wcstombs(ub, b, sizeof(ub));
+    int in = open(ua, O_RDONLY);
+    if (in < 0) return FALSE;
+    int out = open(ub, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (out < 0) { close(in); return FALSE; }
+    char buf[8192]; ssize_t n;
+    while ((n = read(in, buf, sizeof(buf))) > 0) write(out, buf, (size_t)n);
+    close(in); close(out);
+    return TRUE;
+}
+
+BOOL CopyFileExW(const wchar_t* a, const wchar_t* b, void* prog,
+                 void* data, void* cancel, DWORD flags) {
+    (void)prog; (void)data; (void)cancel; (void)flags;
+    return CopyFileW(a, b, FALSE);
+}
+
+void SetConsoleInputExeNameW(const wchar_t* name) {
+    (void)name;
+}
+
+BOOL CreateHardLinkW(const wchar_t* a, const wchar_t* b, void* sa) {
+    (void)sa;
+    char ua[2048], ub[2048];
+    wcstombs(ua, a, sizeof(ua));
+    wcstombs(ub, b, sizeof(ub));
+    return link(ub, ua) == 0;
+}
+
+BOOL CreateSymbolicLinkW(const wchar_t* a, const wchar_t* b, DWORD flags) {
+    (void)flags;
+    char ua[2048], ub[2048];
+    wcstombs(ua, a, sizeof(ua));
+    wcstombs(ub, b, sizeof(ub));
+    return symlink(ub, ua) == 0;
+}
+
+// ── Path / env ─────────────────────────────────────────────────
+
+DWORD GetFullPathNameW(const wchar_t* file, DWORD len, wchar_t* buf, wchar_t** part) {
+    char ufile[2048], ubuf[4096];
+    wcstombs(ufile, file, sizeof(ufile));
+    if (buf) {
+        if (realpath(ufile, ubuf)) {
+            mbstowcs(buf, ubuf, len);
+            if (part) *part = buf;
+            return (DWORD)wcslen(buf);
+        }
+        wcscpy(buf, file);
+        if (part) *part = buf;
+        return (DWORD)wcslen(buf);
+    }
+    return (DWORD)wcslen(file);
+}
+
+static DWORD expand_single_variable(const char* var, char* out, size_t outsz) {
+    const char* v = getenv(var);
+    if (!v) { out[0] = 0; return 0; }
+    snprintf(out, outsz, "%s", v);
+    return (DWORD)strlen(out);
+}
+
+DWORD ExpandEnvironmentStringsA(const char* src, char* dst, DWORD len) {
+    char tmp[4096] = {0};
+    const char* p = src;
+    char* o = tmp;
+    size_t orem = sizeof(tmp) - 1;
+    while (*p && orem > 0) {
+        if (*p == '%') {
+            const char* q = strchr(p + 1, '%');
+            if (q && q > p + 1) {
+                char var[512];
+                size_t vlen = (size_t)(q - p - 1);
+                if (vlen >= sizeof(var)) vlen = sizeof(var) - 1;
+                memcpy(var, p + 1, vlen); var[vlen] = 0;
+                char val[2048];
+                DWORD r = expand_single_variable(var, val, sizeof(val));
+                if (r) {
+                    if (r >= orem) r = (DWORD)orem - 1;
+                    memcpy(o, val, r); o += r; orem -= r;
+                }
+                p = q + 1;
+                continue;
+            }
+        }
+        *o++ = *p++; orem--;
+    }
+    *o = 0;
+    if (dst && len > 0) snprintf(dst, len, "%s", tmp);
+    return (DWORD)strlen(dst ? tmp : src);
+}
+
+DWORD ExpandEnvironmentStringsW(const wchar_t* src, wchar_t* dst, DWORD len) {
+    char usrc[4096], udst[4096];
+    wcstombs(usrc, src, sizeof(usrc));
+    DWORD r = ExpandEnvironmentStringsA(usrc, udst, (DWORD)sizeof(udst));
+    if (dst) mbstowcs(dst, udst, len);
+    return r;
+}
+
+wchar_t* GetEnvironmentStringsW(void) {
+    // Return a block of null-terminated, double-null terminated strings
+    static wchar_t wblock[16384];
+    extern char** environ;
+    wchar_t* p = wblock;
+    for (char** e = environ; *e; e++) {
+        mbstowcs(p, *e, 2048);
+        p += wcslen(p) + 1;
+    }
+    *p = L'\0';
+    return wblock;
+}
+
+BOOL FreeEnvironmentStringsW(wchar_t* e) { (void)e; return TRUE; }
+BOOL SetEnvironmentStringsW(wchar_t* e) { (void)e; return FALSE; }
+
+DWORD GetWindowsDirectoryW(wchar_t* buf, DWORD len) {
+    if (buf && len > 0) wcscpy(buf, L"C:\\Windows");
+    return 9;
+}
+
+BOOL NeedCurrentDirectoryForExePathW(const wchar_t* name) {
+    (void)name;
+    return TRUE;
+}
+
+wchar_t* GetCommandLineW(void) {
+    if (g_cmdline[0]) return g_cmdline;
+    static wchar_t wcmd[4096] = L"cmd.exe";
+    return wcmd;
+}
+
+// ── FormatMessageW ─────────────────────────────────────────────
+
+DWORD FormatMessageW(DWORD flags, void* src, DWORD msgid, DWORD lang,
+                     wchar_t* buf, DWORD len, void* args) {
+    (void)flags; (void)src; (void)msgid; (void)lang; (void)args;
+    if (buf && len > 0) buf[0] = L'\0';
+    return 0;
+}
+
+// ── Time ───────────────────────────────────────────────────────
+
+BOOL CompareFileTime(const FILETIME* a, const FILETIME* b) {
+    if (!a || !b) return 0;
+    if (a->dwLowDateTime < b->dwLowDateTime) return (DWORD)-1;
+    if (a->dwLowDateTime > b->dwLowDateTime) return 1;
+    return 0;
+}
+
+BOOL FileTimeToLocalFileTime(const FILETIME* ft, FILETIME* lft) {
+    if (!ft || !lft) return FALSE;
+    *lft = *ft;
+    return TRUE;
+}
+
+BOOL FileTimeToSystemTime(const FILETIME* ft, void* st) {
+    (void)ft;
+    if (st) memset(st, 0, 16);
+    return TRUE;
+}
+
+BOOL SystemTimeToFileTime(void* st, FILETIME* ft) {
+    (void)st;
+    if (ft) { ft->dwLowDateTime = 0; ft->dwHighDateTime = 0; }
+    return TRUE;
+}
+
+// ── Locale ─────────────────────────────────────────────────────
+
+int CompareStringOrdinal(const wchar_t* a, int al, const wchar_t* b, int bl, BOOL ignore) {
+    (void)ignore;
+    int cmp = wcsncmp(a, b, (size_t)(al < bl ? al : bl));
+    if (cmp != 0) return cmp < 0 ? 1 : 2;
+    if (al < bl) return 1;
+    if (al > bl) return 2;
+    return 1;  // CSTR_EQUAL
+}
+
+BOOL GetLocaleInfoW(int loc, int cls, wchar_t* buf, int len) {
+    (void)loc; (void)cls;
+    if (buf && len > 0) buf[0] = L'\0';
+    return TRUE;
+}
+
+DWORD GetUserDefaultLCID(void) { return 0x0409; }  // en-US
+DWORD GetThreadLocale(void) { return 0x0409; }
+DWORD SetThreadLocale(DWORD loc) { (void)loc; return 0x0409; }
+
+BOOL GetTimeFormatW(int loc, DWORD fmt, void* st, const wchar_t* pat,
+                    wchar_t* buf, int len) {
+    (void)loc; (void)fmt; (void)st; (void)pat;
+    if (buf && len > 0) wcscpy(buf, L"00:00:00");
+    return TRUE;
+}
+
+BOOL GetDateFormatW(int loc, DWORD fmt, void* st, const wchar_t* pat,
+                    wchar_t* buf, int len) {
+    (void)loc; (void)fmt; (void)st; (void)pat;
+    if (buf && len > 0) wcscpy(buf, L"01/01/2025");
+    return TRUE;
+}
+
+BOOL SetLocalTime(void* t) { (void)t; return TRUE; }
+
+// ── System info ────────────────────────────────────────────────
+
+BOOL GetNumaHighestNodeNumber(ULONG* n) { if (n) *n = 0; return TRUE; }
+BOOL GetNumaNodeProcessorMaskEx(void* node, void* mask) {
+    (void)node;
+    if (mask) memset(mask, 0, 16);
+    return TRUE;
+}
+
+BOOL GetCPInfo(int cp, void* info) {
+    (void)cp;
+    if (info) memset(info, 0, 16);
+    return TRUE;
+}
+
+UINT GetACP(void) { return 65001; }  // UTF-8
+
+// ── Stub: WNet / Shell / Branding / Misc ───────────────────────
+
+DWORD WNetAddConnection2WStub(void* a, void* b, void* c, DWORD d) { (void)a; (void)b; (void)c; (void)d; return 12002; }
+DWORD WNetCancelConnection2WStub(void* a, DWORD b, DWORD c) { (void)a; (void)b; (void)c; return 12002; }
+DWORD WNetGetConnectionWStub(void* a, void* b, DWORD* c) { (void)a; (void)b; (void)c; return 12002; }
+void* BrandingFormatString(void* a) { (void)a; return NULL; }
+void CmdBatNotificationStub(void* a) { (void)a; }
+void DoSHChangeNotify(DWORD a, DWORD b, void* c, void* d) { (void)a; (void)b; (void)c; (void)d; }
+BOOL FindFirstStreamWStub2(const wchar_t* a, int b, void* c, DWORD d) { (void)a; (void)b; (void)c; (void)d; return FALSE; }
+BOOL FindNextStreamWStub2(HANDLE a, void* b) { (void)a; (void)b; return FALSE; }
+void GetVDMCurrentDirectoriesStub(void* a, void* b) { (void)a; (void)b; }
+void* LookupAccountSidWStub(void* a, void* b, void* c, DWORD* d, void* e, DWORD* f, void* g) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; return NULL;
+}
+BOOL QueryFullProcessImageNameWStub(HANDLE a, DWORD b, wchar_t* c, DWORD* d) {
+    (void)a; (void)b; (void)d;
+    if (c) wcscpy(c, L"cmd.exe");
+    return TRUE;
+}
+void SaferWorker(void* a, void* b, void* c, DWORD d, void* e) { (void)a; (void)b; (void)c; (void)d; (void)e; }
+BOOL ShellExecuteExW(void* info) { (void)info; return FALSE; }
+void ShellExecuteWorker(void* a, void* b, void* c, void* d, void* e, int f) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f;
+}
+BOOL MessageBeepStub(UINT type) { (void)type; return TRUE; }
+void OutputDebugStringW(const wchar_t* s) { (void)s; }
+void DebugBreak(void) { }
+BOOL DeviceIoControl(HANDLE h, DWORD op, void* in, DWORD insz,
+                     void* out, DWORD outsz, DWORD* ret, void* ovp) {
+    (void)h; (void)op; (void)in; (void)insz;
+    (void)out; (void)outsz; (void)ret; (void)ovp;
+    return FALSE;
+}
+
+// Eventing stubs
+DWORD EventRegister(void* a, void* b, void* c, void* d) { (void)a; (void)b; (void)c; (void)d; return 0; }
+DWORD EventSetInformation(void* a, DWORD b, void* c, DWORD d) { (void)a; (void)b; (void)c; (void)d; return 0; }
+DWORD EventUnregister(void* a) { (void)a; return 0; }
+DWORD EventWriteTransfer(void* a, void* b, void* c, DWORD d, void* e) { (void)a; (void)b; (void)c; (void)d; (void)e; return 0; }
+
+// WinRT stubs
+HRESULT RoInitialize(int mode) { (void)mode; return 0; }
+void RoUninitialize(void) { }
+
+// RaiseFailFastException - called by WIL error handling, just abort
+void RaiseFailFastException(void* er, void* rs, DWORD flags) {
+    (void)er; (void)rs; (void)flags;
+    fprintf(stderr, "[ntll] RaiseFailFastException called - aborting\n");
+    abort();
+}
+
+// API set / delay load
+BOOL ApiSetQueryApiSetPresence(void* ns, BOOL present) { (void)ns; (void)present; return TRUE; }
+void* DelayLoadFailureHook(void* a, void* b) { (void)a; (void)b; return NULL; }
+void* ResolveDelayLoadedAPI(void* base, void* desc, void* hook, void* target, UINT ordinal, UINT flags) {
+    (void)base; (void)desc; (void)hook; (void)ordinal; (void)flags;
+    return target ? target : NULL;
+}
+
+// ── Real cmd.exe gap fillers ────────────────────────────────────────
+
+// MultiByteToWideChar / WideCharToMultiByte
+int MultiByteToWideChar(UINT cp, DWORD flags, const char* src, int srclen,
+                        wchar_t* dst, int dstlen) {
+    (void)cp; (void)flags;
+    if (!src) return 0;
+    if (srclen < 0) srclen = (int)strlen(src);
+    int n = 0;
+    for (int i = 0; i < srclen && (dst == NULL || n < dstlen); i++) {
+        if (dst) dst[n] = (wchar_t)(unsigned char)src[i];
+        n++;
+    }
+    if (dst) dst[n] = 0;
+    return n;
+}
+int WideCharToMultiByte(UINT cp, DWORD flags, const wchar_t* src, int srclen,
+                        char* dst, int dstlen, const char* defch, BOOL* used) {
+    (void)cp; (void)flags; (void)defch; (void)used;
+    if (!src) return 0;
+    if (srclen < 0) srclen = (int)wcslen(src);
+    int n = 0;
+    for (int i = 0; i < srclen && (dst == NULL || n < dstlen); i++) {
+        if (dst) dst[n] = (char)(src[i] & 0xff);
+        n++;
+    }
+    if (dst) dst[n] = 0;
+    return n;
+}
+
+// lstrcmpW / lstrcmpiW
+int lstrcmpW(const wchar_t* a, const wchar_t* b) { return wcscmp(a, b); }
+int lstrcmpiW(const wchar_t* a, const wchar_t* b) {
+    return wcsncasecmp(a, b, SIZE_MAX);
+}
+
+// OpenSemaphoreW / WaitForSingleObjectEx
+HANDLE OpenSemaphoreW(DWORD access, BOOL inherit, const wchar_t* name) {
+    (void)access; (void)inherit; (void)name;
+    return win32_create_semaphore(NULL, 0, 1, NULL);
+}
+DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable) {
+    (void)alertable;
+    return win32_wait_for_single_object(h, ms);
+}
+
+// GetSecurityDescriptorOwner / RevertToSelf stubs
+BOOL GetSecurityDescriptorOwner(void* sd, void** owner, BOOL* def) {
+    (void)sd; if (owner) *owner = NULL; if (def) *def = TRUE; return TRUE;
+}
+HANDLE RevertToSelf(void) { return (HANDLE)1; }
+
+// SetThreadUILanguage: returns previous thread locale; store/return a fake
+UINT SetThreadUILanguage(UINT lang) {
+    (void)lang;
+    return 0x409; /* en-US */
+}
+
+// Registry wrappers over ntll/registry.c
+#ifndef ERROR_SUCCESS
+#define ERROR_SUCCESS 0
+#endif
+#ifndef ERROR_FILE_NOT_FOUND
+#define ERROR_FILE_NOT_FOUND 2
+#endif
+#ifndef ERROR_NO_MORE_ITEMS
+#define ERROR_NO_MORE_ITEMS 259
+#endif
+#ifndef REG_SZ
+#define REG_SZ 1
+#endif
+static void reg_unicode(const wchar_t* name, UNICODE_STRING* u) {
+    u->Length = (uint16_t)(wcslen(name) * sizeof(wchar_t));
+    u->MaximumLength = u->Length + sizeof(wchar_t);
+    u->Buffer = (wchar_t*)name;
+}
+BOOL RegCloseKey(HKEY key) { (void)key; return TRUE; }
+LONG RegOpenKeyExW(HKEY root, const wchar_t* subkey, DWORD opts,
+                   DWORD access, HKEY* out) {
+    (void)opts;
+    UNICODE_STRING name;
+    reg_unicode(subkey ? subkey : L"", &name);
+    OBJECT_ATTRIBUTES oa;
+    memset(&oa, 0, sizeof(oa));
+    oa.Length = sizeof(oa);
+    oa.RootDirectory = (HANDLE)(uintptr_t)root;
+    oa.ObjectName = &name;
+    *out = 0;
+    HANDLE h = 0;
+    NTSTATUS st = nt_open_key((PHANDLE)&h, access, &oa);
+    *out = (HKEY)(uintptr_t)h;
+    if (st == STATUS_OBJECT_NAME_NOT_FOUND) return ERROR_FILE_NOT_FOUND;
+    return st ? (LONG)(st | 0x10000000) : (LONG)ERROR_SUCCESS;
+}
+LONG RegCreateKeyExW(HKEY root, const wchar_t* subkey, DWORD rsv, wchar_t* cls,
+                     DWORD opts, DWORD access, void* sec, HKEY* out, DWORD* disp) {
+    (void)rsv; (void)cls; (void)sec;
+    UNICODE_STRING name;
+    reg_unicode(subkey ? subkey : L"", &name);
+    OBJECT_ATTRIBUTES oa;
+    memset(&oa, 0, sizeof(oa));
+    oa.Length = sizeof(oa);
+    oa.RootDirectory = (HANDLE)(uintptr_t)root;
+    oa.ObjectName = &name;
+    *out = 0;
+    HANDLE h = 0;
+    NTSTATUS st = nt_create_key((PHANDLE)&h, access, &oa, 0, NULL, opts, disp);
+    *out = (HKEY)(uintptr_t)h;
+    return st ? (LONG)(st | 0x10000000) : (LONG)ERROR_SUCCESS;
+}
+LONG RegSetValueExW(HKEY key, const wchar_t* name, DWORD rsv, DWORD type,
+                    const BYTE* data, DWORD size) {
+    (void)rsv;
+    UNICODE_STRING un;
+    reg_unicode(name ? name : L"", &un);
+    NTSTATUS st = nt_set_value_key(key, &un, 0, type, (PVOID)data, size);
+    return st ? (LONG)(st | 0x10000000) : (LONG)0;
+}
+LONG RegQueryValueExW(HKEY key, const wchar_t* name, DWORD* rsv, DWORD* type,
+                      BYTE* data, DWORD* size) {
+    (void)rsv;
+    UNICODE_STRING un;
+    reg_unicode(name ? name : L"", &un);
+    ULONG ret = 0;
+    NTSTATUS st = nt_query_value_key(key, &un, 0, data, size ? *size : 0, &ret);
+    if (type) *type = REG_SZ;
+    if (size) *size = ret;
+    if (st == STATUS_OBJECT_NAME_NOT_FOUND) return ERROR_FILE_NOT_FOUND;
+    return st ? (LONG)(st | 0x10000000) : (LONG)ERROR_SUCCESS;
+}
+LONG RegDeleteValueW(HKEY key, const wchar_t* name) {
+    (void)key; (void)name; return (LONG)ERROR_SUCCESS;
+}
+LONG RegDeleteKeyExW(HKEY root, const wchar_t* subkey, DWORD access, DWORD rsv) {
+    (void)root; (void)subkey; (void)access; (void)rsv; return (LONG)ERROR_SUCCESS;
+}
+LONG RegEnumKeyExW(HKEY key, DWORD index, wchar_t* name, DWORD* namelen,
+                   DWORD* cls, wchar_t* clsname, DWORD* clslen, FILETIME* ft) {
+    (void)key; (void)index; (void)name; (void)cls; (void)clsname;
+    if (namelen) *namelen = 0; if (clslen) *clslen = 0;
+    if (ft) memset(ft, 0, sizeof(*ft));
+    return ERROR_NO_MORE_ITEMS;
+}
+LONG RegGetValueW(HKEY key, const wchar_t* subkey, const wchar_t* name,
+                  DWORD flags, DWORD* type, BYTE* data, DWORD* size) {
+    (void)flags; (void)subkey;
+    UNICODE_STRING un;
+    reg_unicode(name ? name : L"", &un);
+    ULONG ret = 0;
+    NTSTATUS st = nt_query_value_key(key, &un, 0, data, size ? *size : 0, &ret);
+    if (type) *type = REG_SZ;
+    if (size) *size = ret;
+    if (st == STATUS_OBJECT_NAME_NOT_FOUND) return ERROR_FILE_NOT_FOUND;
+    return st ? (LONG)(st | 0x10000000) : (LONG)ERROR_SUCCESS;
 }

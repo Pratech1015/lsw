@@ -9,10 +9,180 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
-
+#include <sys/mman.h>
+#include <sys/syscall.h>
 #include "ntll.h"
 
 static PNTLL_MODULE g_main_module = NULL;
+
+/* fake Windows TEB/PEB so PE code can access gs-relative structures */
+static void* g_teb = NULL;
+static void* g_peb = NULL;
+void* g_procparams = NULL;
+wchar_t g_cmdline[4096] = {0};
+
+#ifdef __x86_64__
+#ifndef ARCH_SET_GS
+#define ARCH_SET_GS 0x1001
+#endif
+/* minimal TEB offsets (x64) */
+#define TEB_STACKBASE     0x08
+#define TEB_STACKLIMIT    0x10
+#define TEB_SELF          0x30
+#define TEB_PEB           0x60
+/* minimal PEB offsets (x64) */
+#define PEB_LOCK          0x04
+#define PEB_IMAGEBASE     0x10
+#define PEB_LDR           0x18
+#define PEB_PARAMS        0x20
+#define PEB_HEAP          0x30
+#define PEB_MAXHEAP       0x40
+/* PEB_LDR_DATA offsets */
+#define LDR_LEN           0x00
+#define LDR_INIT          0x04
+#define LDR_LOCK          0x08
+#define LDR_MODLOAD       0x10  /* InLoadOrderModuleList */
+#define LDR_MODMEM        0x20  /* InMemoryOrderModuleList  */
+#define LDR_MODINIT       0x30  /* InInitializationOrderModuleList */
+/* RTL_USER_PROCESS_PARAMETERS offsets (x64) */
+#define RUP_LEN           0x00
+#define RUP_MAXLEN        0x04
+#define RUP_CONSOLE       0x10  /* ConsoleHandle (Ptr64) */
+#define RUP_CONFLAGS      0x18  /* ConsoleFlags */
+#define RUP_STDIN         0x20  /* StandardInput (Ptr64) */
+#define RUP_STDOUT        0x28  /* StandardOutput (Ptr64) */
+#define RUP_STDERR        0x30  /* StandardError (Ptr64) */
+#define RUP_CURDIR        0x38  /* CurrentDirectoryDosPath(UNICODE_STRING) */
+#define RUP_CURDIRHANDLE  0x48  /* CurrentDirectoryHandle */
+#define RUP_DLLPATH       0x58
+#define RUP_IMAGEPATH     0x68
+#define RUP_CMDLINE       0x78
+#define RUP_ENV           0x88
+
+
+static void setup_win_teb_peb(PNTLL_MODULE module, int argc, char** argv) {
+    /* reserve 16 pages: TEB, PEB, LDR, proc params, cmdline, image path, env */
+    size_t pagesz = 4096;
+    void* base = mmap(NULL, pagesz * 16, PROT_READ|PROT_WRITE,
+                      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) return;
+    memset(base, 0, pagesz * 16);
+    g_teb        = base;
+    g_peb        = (char*)base + pagesz;      /* page 1 */
+    void* ldr    = (char*)base + pagesz * 2;  /* page 2 */
+    g_procparams = (char*)base + pagesz * 3;  /* page 3-4 */
+    wchar_t* wcmd_buf = (wchar_t*)g_procparams;              /* page 3 */
+    wchar_t* wp = (wchar_t*)((char*)base + pagesz * 6);      /* page 6: image path */
+    wchar_t* wenv = (wchar_t*)((char*)base + pagesz * 8);    /* page 8+: env block */
+
+    /* build command line from argv */
+    size_t cmd_len = 0;
+    for (int i = 0; i < argc; i++) cmd_len += strlen(argv[i]) + 3;
+    wchar_t* wc_cmd = malloc((cmd_len + 2) * sizeof(wchar_t));
+    wchar_t* wcp = wc_cmd;
+    for (int i = 0; i < argc; i++) {
+        if (i > 0) *wcp++ = L' ';
+        *wcp++ = L'"';
+        for (const char* s = argv[i]; *s; s++) *wcp++ = (wchar_t)(unsigned char)*s;
+        *wcp++ = L'"';
+    }
+    *wcp = 0;
+    size_t cmd_charcount = (size_t)(wcp - wc_cmd);
+    /* save command line for GetCommandLineW before struct header overwrites wcmd_buf */
+    memcpy(g_cmdline, wc_cmd, (cmd_charcount + 1) * sizeof(wchar_t));
+    /* write into process params region */
+    memcpy(wcmd_buf, wc_cmd, (cmd_charcount + 1) * sizeof(wchar_t));
+    free(wc_cmd);
+    /* set up RTL_USER_PROCESS_PARAMETERS */
+    uint32_t* pup_len = (uint32_t*)((char*)g_procparams + RUP_LEN);
+    uint32_t* pup_maxlen = (uint32_t*)((char*)g_procparams + RUP_MAXLEN);
+    *pup_len = pagesz;
+    *pup_maxlen = pagesz;
+    /* ConsoleHandle = stdin handle (console attached) */
+    uintptr_t* con = (uintptr_t*)((char*)g_procparams + RUP_CONSOLE);
+    *con = (uintptr_t)0; /* placeholder, set after handle alloc */
+    /* ImagePathName */
+    uint16_t* imgpath_u = (uint16_t*)((char*)g_procparams + RUP_IMAGEPATH);
+    uint64_t* imgpath_b = (uint64_t*)((char*)g_procparams + RUP_IMAGEPATH + 8);
+    size_t path_len = module ? strlen(module->full_path) : 0;
+    for (size_t i = 0; i < path_len; i++) wp[i] = (wchar_t)(unsigned char)module->full_path[i];
+    wp[path_len] = 0;
+    imgpath_u[0] = (uint16_t)(path_len * sizeof(wchar_t));  /* Length */
+    imgpath_u[1] = (uint16_t)((path_len + 1) * sizeof(wchar_t)); /* MaximumLength */
+    *imgpath_b = (uintptr_t)wp;
+    /* CommandLine */
+    uint16_t* cmd_u = (uint16_t*)((char*)g_procparams + RUP_CMDLINE);
+    uint64_t* cmd_b = (uint64_t*)((char*)g_procparams + RUP_CMDLINE + 8);
+    cmd_u[0] = (uint16_t)(cmd_charcount * sizeof(wchar_t));
+    cmd_u[1] = (uint16_t)((cmd_charcount + 1) * sizeof(wchar_t));
+    *cmd_b = (uintptr_t)wcmd_buf;
+    /* Environment: null-terminated list of "KEY=VALUE" wide strings, then double-null */
+    extern char** environ;
+    wchar_t* wep = wenv;
+    for (char** e = environ; *e; e++) {
+        size_t elen = strlen(*e);
+        for (size_t i = 0; i < elen; i++) wep[i] = (wchar_t)(unsigned char)(*e)[i];
+        wep += elen;
+        *wep++ = 0;
+    }
+    *wep = 0; wep++; *wep = 0; /* double-null terminate */
+    uint64_t* env_ptr = (uint64_t*)((char*)g_procparams + RUP_ENV);
+    *env_ptr = (uintptr_t)wenv;
+
+    /* PEB_LDR_DATA */
+    memset(ldr, 0, pagesz);
+    uint32_t* ldr_len = (uint32_t*)((char*)ldr + LDR_LEN);
+    *ldr_len = 0x58;
+    uint32_t* ldr_init = (uint32_t*)((char*)ldr + LDR_INIT);
+    *ldr_init = 1; /* Initialized */
+
+    /* PEB */
+    uint8_t* peb8 = (uint8_t*)g_peb;
+    peb8[0x02] = 0; /* BeingDebugged = FALSE */
+    peb8[0x03] = 0; /* BitField */
+    uint64_t* peb_ib = (uint64_t*)((char*)g_peb + PEB_IMAGEBASE);
+    *peb_ib = (uintptr_t)(module ? module->base_address : NULL);
+    uint64_t* peb_ldr = (uint64_t*)((char*)g_peb + PEB_LDR);
+    *peb_ldr = (uintptr_t)ldr;
+    uint64_t* peb_params = (uint64_t*)((char*)g_peb + PEB_PARAMS);
+    *peb_params = (uintptr_t)g_procparams;
+    /* heap: sentinel */
+    uint64_t* peb_heap = (uint64_t*)((char*)g_peb + PEB_HEAP);
+    *peb_heap = 0; /* 0 = no heap yet; GetProcessHeap returns sentinel */
+    uint64_t* peb_maxh = (uint64_t*)((char*)g_peb + PEB_MAXHEAP);
+    *peb_maxh = 0;
+
+    /* TEB */
+    uint64_t* teb64 = (uint64_t*)g_teb;
+    teb64[1] = 0; /* StackBase (offset 0x08) — will be set after stack snapshot */
+    teb64[2] = 0; /* StackLimit */
+    teb64[TEB_SELF/8] = (uintptr_t)g_teb;
+    teb64[TEB_PEB/8]  = (uintptr_t)g_peb;
+    /* set stack base/limit from current rsp */
+    uintptr_t rsp;
+    __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
+    /* Windows stack grows down; StackBase = top of stack (+ 4MB guard) */
+    teb64[TEB_STACKBASE/8]  = rsp + 4 * 1024 * 1024;
+    teb64[TEB_STACKLIMIT/8] = rsp - 128 * 1024;
+
+    /* set GS segment base to the TEB */
+    long ret = syscall(SYS_arch_prctl, ARCH_SET_GS, g_teb);
+    if (ret != 0) {
+        NTLL_LOG_WARN("arch_prctl ARCH_SET_GS failed (%ld), "
+                      "PE code using gs-relative access will crash", ret);
+    } else {
+        NTLL_LOG_INFO("set GS base -> TEB at %p", g_teb);
+    }
+
+    /* populate PEB->ProcessParameters standard handles */
+    extern void win32_init_peb_standard_handles(void);
+    win32_init_peb_standard_handles();
+}
+#else
+static void setup_win_teb_peb(PNTLL_MODULE module, int argc, char** argv) {
+    (void)module; (void)argc; (void)argv;
+}
+#endif
 
 /*
  * Builtin programs shipped with LSW: cmd.exe and a small set of console
@@ -24,8 +194,7 @@ static int run_builtin(const char* base, int argc, char** argv) {
     size_t len = strlen(base);
     const char* ext = (len > 4) ? base + (len - 4) : NULL;
 
-    if (strcasecmp(base, "cmd") == 0 || strcasecmp(base, "cmd.exe") == 0 ||
-        (ext && (strcasecmp(ext, ".bat") == 0 || strcasecmp(ext, ".cmd") == 0))) {
+    if (ext && (strcasecmp(ext, ".bat") == 0 || strcasecmp(ext, ".cmd") == 0)) {
         return nt_builtin_cmd(argc, argv);
     }
     int r = nt_builtin_exec(base, argc, argv);
@@ -109,6 +278,19 @@ int main(int argc, char* argv[]) {
     // Try the builtin program set first (cmd.exe, winver, ..., *.bat)
     const char* base = strrchr(program, '/');
     base = base ? base + 1 : program;
+
+    // Resolve a bare "cmd"/"cmd.exe" to the real Windows 11 system shell in the
+    // distro rootfs so it runs as a real PE through the NTLL loader rather than
+    // the custom builtin interpreter.
+    if (strcasecmp(base, "cmd") == 0 || strcasecmp(base, "cmd.exe") == 0) {
+        const char* rootfs = getenv("LSW_ROOTFS");
+        static char cmd_path[4096];
+        if (rootfs) {
+            snprintf(cmd_path, sizeof(cmd_path), "%s/Windows/System32/cmd.exe", rootfs);
+            if (access(cmd_path, R_OK) == 0) program = cmd_path;
+        }
+    }
+
     int builtin = run_builtin(base, argc - rest_start, &argv[rest_start]);
     if (builtin >= 0) {
         ntll_cleanup();
@@ -139,6 +321,10 @@ int main(int argc, char* argv[]) {
 
     int argc_native = argc - rest_start;
     char** argv_native = &argv[rest_start];
+
+    // Build a synthetic Windows TEB/PEB and point the GS segment at it so
+    // PE code can read %gs-relative Windows structures (TEB, PEB).
+    setup_win_teb_peb(g_main_module, argc_native, argv_native);
 
     // Invoke the entry point with Windows calling convention (ms_abi wrapper)
     void (*entry)(int, char**) = (void (*)(int, char**))(uintptr_t)g_main_module->entry_point;

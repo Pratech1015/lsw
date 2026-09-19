@@ -331,6 +331,10 @@ BOOL win32_fill_console_output_attribute(HANDLE console, WORD attr,
                                         DWORD count, void* start, DWORD* written);
 BOOL win32_set_console_text_attribute(HANDLE console, WORD attrs);
 BOOL win32_set_consoleCursorPosition(HANDLE console, void* pos);
+
+/* Handle management */
+HANDLE win32_handle_alloc(int linux_fd);
+void win32_init_peb_standard_handles(void);
 void win32_sleep(DWORD ms);
 DWORD win32_get_tick_count(void);
 void win32_get_system_time(void* st);

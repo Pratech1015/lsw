@@ -242,14 +242,19 @@ static void cmd_prompt_make(char* out, size_t out_sz) {
 }
 
 static int cmd_cd(int argc, char** argv) {
-    if (argc > 2) { printf(CMD_INVAL_CMD); return 1; }
     if (argc == 1) {
         char c[CMD_MAX_LINE];
         unix_to_win(g_cwd, c, sizeof(c));
         printf("%s\n", c);
         return 0;
     }
-    if (strcmp(argv[1], "..") == 0) {
+
+    /* cd /d <path> — skip the /d flag */
+    int path_idx = 1;
+    if (argc >= 3 && (strcmp(argv[1], "/d") == 0 || strcmp(argv[1], "/D") == 0))
+        path_idx = 2;
+
+    if (strcmp(argv[path_idx], "..") == 0) {
         char* s = strrchr(g_cwd, '/');
         if (s && s != g_cwd) {
             *s = '\0';
@@ -259,7 +264,7 @@ static int cmd_cd(int argc, char** argv) {
         return 0;
     }
     char target[CMD_MAX_LINE];
-    win_to_unix(argv[1], target, sizeof(target));
+    win_to_unix(argv[path_idx], target, sizeof(target));
     struct stat st;
     if (stat(target, &st) == 0 && S_ISDIR(st.st_mode)) {
         snprintf(g_cwd, sizeof(g_cwd), "%s", target);
