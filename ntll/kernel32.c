@@ -147,7 +147,7 @@ static int match_wildcard(const char* pattern, const char* name) {
         if (*p == '*') {
             star_p = p++;
             star_n = n;
-        } else if (*p == '?' || *p == *n) {
+        } else if (*p == '?' || (*p | 0x20) == (*n | 0x20)) {
             p++; n++;
         } else if (star_p) {
             p = star_p + 1;
@@ -522,6 +522,46 @@ DWORD win32_get_file_attributes(const char* path) {
     return FILE_ATTRIBUTE_NORMAL;
 }
 
+static int win32_ascii_ci_eq(const char* a, const char* b) {
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a, cb = (unsigned char)*b;
+        if (ca >= 'A' && ca <= 'Z') ca += 0x20;
+        if (cb >= 'A' && cb <= 'Z') cb += 0x20;
+        if (ca != cb) return 0;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+/* stat a unix path, resolving each directory component case-insensitively
+ * (Windows names are compared case-insensitively).  Exact-case wins first. */
+static int k32_ci_stat(const char* unix_path, struct stat* st) {
+    if (!unix_path || !unix_path[0]) return -1;
+    if (stat(unix_path, st) == 0) return 0;
+    char comp[512], cand[8192], base[4096];
+    snprintf(base, sizeof(base), "%s", unix_path);
+    char* sl = strrchr(base, '/');
+    if (!sl) return -1;
+    size_t clen = strlen(sl + 1);
+    if (clen >= sizeof(comp)) clen = sizeof(comp) - 1;
+    memcpy(comp, sl + 1, clen);
+    comp[clen] = 0;
+    *sl = 0;
+    if (!base[0]) strcpy(base, "/");
+    DIR* d = opendir(base);
+    if (!d) return -1;
+    struct dirent* e;
+    int rc = -1;
+    while ((e = readdir(d)) != NULL) {
+        if (win32_ascii_ci_eq(e->d_name, comp)) {
+            snprintf(cand, sizeof(cand), "%s/%s", base, e->d_name);
+            if (stat(cand, st) == 0) { rc = 0; break; }
+        }
+    }
+    closedir(d);
+    return rc;
+}
+
 DWORD GetFileAttributesW_impl(const wchar_t* wpath) {
     if (!wpath) { win32_set_last_error(87); return 0xFFFFFFFF; }
     char upath[2048];
@@ -530,7 +570,7 @@ DWORD GetFileAttributesW_impl(const wchar_t* wpath) {
     char unix_path[MAX_PATH * 4];
     nt_to_unix_path(upath, unix_path, sizeof(unix_path));
     struct stat st;
-    if (stat(unix_path, &st) != 0) {
+    if (k32_ci_stat(unix_path, &st) != 0) {
         win32_set_last_error(errno_to_win32(errno));
         return 0xFFFFFFFF;
     }
@@ -1539,8 +1579,10 @@ BOOL GetFileAttributesExW(const wchar_t* p, int cls, void* data) {
     char upath[2048];
     k32_utf16le_to_utf8(p, upath, sizeof(upath));
     for (char* s = upath; *s; s++) { if (*s == '\\') *s = '/'; }
+    char unix_path[MAX_PATH * 4];
+    nt_to_unix_path(upath, unix_path, sizeof(unix_path));
     struct stat st;
-    if (stat(upath, &st) != 0) return FALSE;
+    if (k32_ci_stat(unix_path, &st) != 0) return FALSE;
     memset(data, 0, 40);
     ((DWORD*)data)[0] = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
     return TRUE;
@@ -1725,53 +1767,73 @@ BOOL CreateSymbolicLinkW(const wchar_t* a, const wchar_t* b, DWORD flags) {
 // ── Path / env ─────────────────────────────────────────────────
 
 DWORD GetFullPathNameW(const wchar_t* file, DWORD len, wchar_t* buf, wchar_t** part) {
-    char ufile[2048], ubuf[4096];
+    char ufile[2048];
+    char winpath[8192];
+    ensure_cwd_init();
     if (file) k32_utf16le_to_utf8(file, ufile, sizeof(ufile));
     else ufile[0] = 0;
 
-    /* Handle bare drive letter ("C") or drive letter with colon ("C:", "C:file") */
-    if (ufile[0] >= 'A' && ufile[0] <= 'Z' && (ufile[1] == '\0' || (ufile[1] == ':' && ufile[2] == '\0'))) {
-        if (buf) {
-            if (len < 4) { win32_set_last_error(122); return 4; }
-            uint16_t* wb = (uint16_t*)buf;
-            wb[0] = (uint16_t)ufile[0];
-            wb[1] = 0x003A;
-            wb[2] = 0x005C;
-            wb[3] = 0;
-            if (part) *part = buf + 3;
+    /* current windows cwd as UTF-8, backslash form */
+    char wincwd[2048];
+    k32_utf16le_to_utf8((const uint16_t*)g_windows_cwd, wincwd, sizeof(wincwd));
+    for (char* s = wincwd; *s; s++) if (*s == '/') *s = '\\';
+
+    winpath[0] = 0;
+    if (!ufile[0]) {
+        snprintf(winpath, sizeof(winpath), "%s", wincwd);
+    } else if (((ufile[0] >= 'A' && ufile[0] <= 'Z') || (ufile[0] >= 'a' && ufile[0] <= 'z')) && ufile[1] == ':') {
+        if (ufile[2] == '\\' || ufile[2] == '/') {
+            snprintf(winpath, sizeof(winpath), "%s", ufile);          /* "C:\foo" absolute */
+        } else if (!ufile[2]) {
+            snprintf(winpath, sizeof(winpath), "%s", wincwd);         /* bare "C:" -> cwd */
+        } else {
+            snprintf(winpath, sizeof(winpath), "%s\\%s", wincwd, ufile + 2); /* "C:foo" */
         }
-        return 3;
+    } else if (ufile[0] == '\\') {
+        snprintf(winpath, sizeof(winpath), "%c:%s", wincwd[0] ? wincwd[0] : 'C', ufile); /* "\foo" root-relative */
+    } else {
+        if (wincwd[0] && wincwd[1] == ':' && wincwd[2] == '\\') {
+            snprintf(winpath, sizeof(winpath), "%s\\%s", wincwd, ufile);  /* relative to cwd */
+        } else {
+            snprintf(winpath, sizeof(winpath), "C:\\%s", ufile);
+        }
+    }
+    for (char* s = winpath; *s; s++) if (*s == '/') *s = '\\';
+    /* Windows paths are single-backslash; collapse any doubled ones we
+     * introduced by appending to a cwd that already ends in '\'. */
+    {
+        char* w = winpath;
+        while ((w = strstr(w, "\\\\")) != NULL)
+            memmove(w + 1, w + 2, strlen(w + 2) + 1);
     }
 
-    char unix_path[MAX_PATH * 4];
-    nt_to_unix_path(ufile, unix_path, sizeof(unix_path));
     if (buf) {
-        const char* drive_c = "/var/lib/lsw/distros/windows-11/rootfs/drive_c";
-        if (unix_path[0] != '/') {
-            char abs_path[4096];
-            snprintf(abs_path, sizeof(abs_path), "%s/%s", drive_c, unix_path);
-            if (realpath(abs_path, ubuf)) {
-                const char* rel = ubuf + strlen(drive_c);
-                if (*rel == '/') rel++;
+        char unix_path[MAX_PATH * 4];
+        nt_to_unix_path(winpath, unix_path, sizeof(unix_path));
+        char canon[4096];
+        if (realpath(unix_path, canon)) {
+            /* Rebuild a Windows path from the canonical host path by taking
+             * the suffix after the drive_? mount component.  This is robust to
+             * where the rootfs actually lives (absolute, relative, or
+             * symlinked), unlike a system_root string-prefix comparison. */
+            char* d = strstr(canon, "/drive_");
+            if (d && ((d[7] >= 'a' && d[7] <= 'z') || (d[7] >= 'A' && d[7] <= 'Z')) &&
+                (d[8] == '/' || d[8] == '\0')) {
                 char nt_result[MAX_PATH];
-                snprintf(nt_result, sizeof(nt_result), "C:\\%s", rel);
-                int n = k32_utf8_to_utf16le(nt_result, buf, (size_t)len);
-                if (part) *part = buf;
-                return (DWORD)n;
+                char drv = (d[7] >= 'a' && d[7] <= 'z') ? (char)(d[7] - 'a' + 'A') : d[7];
+                d += 9;
+                while (*d == '/') d++;
+                snprintf(nt_result, sizeof(nt_result), "%c:\\%s", drv, d);
+                for (char* p = nt_result; *p; p++) if (*p == '/') *p = '\\';
+                snprintf(winpath, sizeof(winpath), "%s", nt_result);
             }
         }
-        if (realpath(unix_path, ubuf)) {
-            char nt_result[MAX_PATH];
-            unix_to_nt_path(ubuf, nt_result, sizeof(nt_result));
-            int n = k32_utf8_to_utf16le(nt_result, buf, (size_t)len);
-            if (part) *part = buf;
-            return (DWORD)n;
-        }
-        int n = k32_utf8_to_utf16le(ufile, buf, (size_t)len);
+        if (len < 4) { win32_set_last_error(122); return (DWORD)strlen(winpath); }
+        int n = k32_utf8_to_utf16le(winpath, buf, (size_t)len);
         if (part) *part = buf;
         return (DWORD)n;
     }
-    return (DWORD)k32_utf16le_to_utf8(file, NULL, 0);
+    return (DWORD)strlen(winpath);
 }
 
 static DWORD expand_single_variable(const char* var, char* out, size_t outsz) {
