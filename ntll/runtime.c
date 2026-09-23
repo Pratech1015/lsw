@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <execinfo.h>
 #include "ntll.h"
 
 static PNTLL_MODULE g_main_module = NULL;
@@ -20,6 +21,7 @@ static void* g_teb = NULL;
 static void* g_peb = NULL;
 void* g_procparams = NULL;
 wchar_t g_cmdline[4096] = {0};
+extern char* g_image_path;
 
 #ifdef __x86_64__
 #ifndef ARCH_SET_GS
@@ -116,18 +118,53 @@ static void setup_win_teb_peb(PNTLL_MODULE module, int argc, char** argv) {
     cmd_u[0] = (uint16_t)(cmd_charcount * sizeof(wchar_t));
     cmd_u[1] = (uint16_t)((cmd_charcount + 1) * sizeof(wchar_t));
     *cmd_b = (uintptr_t)wcmd_buf;
-    /* Environment: null-terminated list of "KEY=VALUE" wide strings, then double-null */
+    /* Environment: null-terminated list of "KEY=VALUE" wide strings, then double-null.
+     * Use proper 2-byte UTF-16LE encoding (Windows wchar_t = 2 bytes).
+     * Filter out Linux-specific env vars that would confuse PE code. */
     extern char** environ;
-    wchar_t* wep = wenv;
+    uint16_t* wep = (uint16_t*)wenv;
+    /* Host env vars to skip (Linux-specific, not meaningful to PE code) */
+    static const char* skip_vars[] = {
+        "PWD", "OLDPWD", "HOME", "SHELL", "USER", "LOGNAME", "TERM",
+        "LS_COLORS", "LSW_MODULE_PATH", "LSW_ROOTFS", "LSW_TRACE_WCSRCHR",
+        "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS",
+        "COLORTERM", "CONDA_DEFAULT_ENV", "CONDA_PREFIX",
+        "_", NULL
+    };
     for (char** e = environ; *e; e++) {
-        size_t elen = strlen(*e);
-        for (size_t i = 0; i < elen; i++) wep[i] = (wchar_t)(unsigned char)(*e)[i];
-        wep += elen;
-        *wep++ = 0;
+        /* Extract variable name (before '=') */
+        const char* eq = strchr(*e, '=');
+        if (!eq) continue;
+        size_t namelen = (size_t)(eq - *e);
+        /* Check if this var should be skipped */
+        int skip = 0;
+        for (const char** s = skip_vars; *s; s++) {
+            if (strlen(*s) == namelen && strncmp(*e, *s, namelen) == 0) {
+                skip = 1;
+                break;
+            }
+        }
+        if (skip) continue;
+        /* Write KEY=VALUE as 2-byte UTF-16LE */
+        k32_utf8_to_utf16le(*e, wep, 2048);
+        while (*wep) wep++;
+        wep++; /* skip null terminator */
     }
     *wep = 0; wep++; *wep = 0; /* double-null terminate */
     uint64_t* env_ptr = (uint64_t*)((char*)g_procparams + RUP_ENV);
     *env_ptr = (uintptr_t)wenv;
+
+    /* CurrentDirectory = C:\ (CURDIR structure at RUP_CURDIR)
+     * Use a separate buffer (page 9) for the path string. */
+    static const uint16_t kCwd[] = { 'C', ':', '\\', 0 };
+    uint16_t* curdir_buf = (uint16_t*)((char*)base + pagesz * 9);
+    memcpy(curdir_buf, kCwd, sizeof(kCwd));
+    uint16_t* curdir_len = (uint16_t*)((char*)g_procparams + RUP_CURDIR);
+    uint16_t* curdir_maxlen = (uint16_t*)((char*)g_procparams + RUP_CURDIR + 2);
+    *curdir_len = (uint16_t)(3 * sizeof(uint16_t));
+    *curdir_maxlen = (uint16_t)(4 * sizeof(uint16_t));
+    uint64_t* curdir_ptr = (uint64_t*)((char*)g_procparams + RUP_CURDIR + 8);
+    *curdir_ptr = (uintptr_t)curdir_buf;
 
     /* PEB_LDR_DATA */
     memset(ldr, 0, pagesz);
@@ -219,6 +256,12 @@ static void usage(const char* prog) {
 
 static void signal_handler(int sig) {
     fprintf(stderr, "[lsw] process interrupted by signal %d\n", sig);
+    if (sig == SIGSEGV) {
+        void* ret[16];
+        int n = backtrace(ret, 16);
+        fprintf(stderr, "[lsw] backtrace (%d frames):\n", n);
+        backtrace_symbols_fd(ret, n, 2);
+    }
     exit(128 + sig);
 }
 
@@ -298,6 +341,9 @@ int main(int argc, char* argv[]) {
     }
 
     NTLL_LOG_INFO("image: %s", program);
+
+    /* Set global image path for nt_get_system_root auto-detection */
+    g_image_path = (char*)program;
 
     // Load the executable
     g_main_module = pe_load(program);

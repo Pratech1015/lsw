@@ -191,7 +191,19 @@ NTSTATUS NtQueryInformationProcess(HANDLE h, int cls, void* buf,
 // ── Rtl* helpers ───────────────────────────────────────────────
 
 void RtlCaptureContext(CONTEXT* ctx) {
-    if (ctx) memset(ctx, 0, sizeof(CONTEXT));
+    if (!ctx) return;
+    memset(ctx, 0, sizeof(CONTEXT));
+    /* Capture the actual register state so SEH unwind has valid data */
+    __asm__ __volatile__ (
+        "mov %%rax, %0\n\t"  "mov %%rbx, %1\n\t"
+        "mov %%rcx, %2\n\t"  "mov %%rdx, %3\n\t"
+        "mov %%rsi, %4\n\t"  "mov %%rdi, %5\n\t"
+        "mov %%rbp, %6\n\t"  "mov %%rsp, %7\n\t"
+        : "=m"(ctx->Rax), "=m"(ctx->Rbx), "=m"(ctx->Rcx), "=m"(ctx->Rdx),
+          "=m"(ctx->Rsi), "=m"(ctx->Rdi), "=m"(ctx->Rbp), "=m"(ctx->Rsp)
+        : : "memory");
+    /* RIP = return address of caller */
+    ctx->Rip = (ULONG_PTR)__builtin_return_address(0);
 }
 
 void RtlVirtualUnwind(DWORD type, ULONGLONG base, ULONGLONG pc,

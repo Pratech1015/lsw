@@ -19,6 +19,7 @@
 #include <ctype.h>
 #include <wctype.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #include "ntll.h"
 
@@ -441,10 +442,68 @@ int _o__dup2(int a, int b) { return dup2(a, b); }
 int _o__close(int fd) { return close(fd); }
 
 FILE* _o__wpopen(const wchar_t* cmd, const wchar_t* mode) {
-    (void)cmd; (void)mode; return NULL;
+    if (!cmd) return NULL;
+    char cmd_utf8[4096];
+    const uint16_t* u16cmd = (const uint16_t*)cmd;
+    size_t j = 0;
+    for (size_t i = 0; u16cmd[i] && j < sizeof(cmd_utf8) - 1; i++) {
+        uint16_t ch = u16cmd[i];
+        if (ch < 0x80) cmd_utf8[j++] = (char)ch;
+        else { cmd_utf8[j++] = '?'; }
+    }
+    cmd_utf8[j] = 0;
+
+    char mode_utf8[64] = "r";
+    if (mode) {
+        const uint16_t* u16mode = (const uint16_t*)mode;
+        size_t mj = 0;
+        for (size_t i = 0; u16mode[i] && mj < sizeof(mode_utf8) - 1; i++) {
+            uint16_t ch = u16mode[i];
+            if (ch < 0x80) mode_utf8[mj++] = (char)ch;
+            else { mode_utf8[mj++] = '?'; }
+        }
+        mode_utf8[mj] = 0;
+    }
+
+    int is_write = (strchr(mode_utf8, 'w') || strchr(mode_utf8, 'a'));
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return NULL;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* child */
+        if (is_write) {
+            close(pipefd[1]);
+            dup2(pipefd[0], STDIN_FILENO);
+            close(pipefd[0]);
+        } else {
+            close(pipefd[0]);
+            dup2(pipefd[1], STDOUT_FILENO);
+            dup2(pipefd[1], STDERR_FILENO);
+            close(pipefd[1]);
+        }
+        execl("/bin/sh", "sh", "-c", cmd_utf8, (char*)NULL);
+        _exit(127);
+    }
+
+    /* parent */
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return NULL; }
+    if (is_write) {
+        close(pipefd[1]);
+        return fdopen(pipefd[0], "r");
+    } else {
+        close(pipefd[0]);
+        return fdopen(pipefd[1], "w");
+    }
 }
 
-int _o__pclose(FILE* f) { (void)f; return -1; }
+int _o__pclose(FILE* f) {
+    if (!f) return -1;
+    fclose(f);
+    int status;
+    waitpid(-1, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
 
 int _o__pipe(int fds[2], unsigned int size, int text_mode) {
     (void)size; (void)text_mode;
@@ -458,32 +517,104 @@ int _o__pipe(int fds[2], unsigned int size, int text_mode) {
 char* _o_setlocale(int cat, const char* locale) { return setlocale(cat, locale); }
 int _o__configthreadlocale(int flag) { (void)flag; return 0; }
 int _o__configure_narrow_argv(int mode) {
-    fprintf(stderr, "[trace] _o__configure_narrow_argv mode=%d\n", mode);
+    (void)mode;
     return 0;
 }
 int _o__initialize_narrow_environment(void) {
-    fprintf(stderr, "[trace] _o__initialize_narrow_environment\n");
     return 0;
 }
 
-char** _o__get_initial_narrow_environment(void) { return environ; }
+/* Filtered narrow environment: Linux-specific vars removed, Windows paths used */
+static char* g_filtered_environ[512];
+static int g_filtered_environ_built = 0;
 
-char*** _o___p__environ(void) { return &environ; }
+static void build_filtered_environ(void) {
+    if (g_filtered_environ_built) return;
+    g_filtered_environ_built = 1;
+    extern char** environ;
+    static const char* skip_vars[] = {
+        "PWD", "OLDPWD", "HOME", "SHELL", "USER", "LOGNAME", "TERM",
+        "LS_COLORS", "LSW_MODULE_PATH", "LSW_ROOTFS", "LSW_TRACE_WCSRCHR",
+        "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS",
+        "COLORTERM", "CONDA_DEFAULT_ENV", "CONDA_PREFIX",
+        "_", NULL
+    };
+    static char overrides[16][512];
+    int oidx = 0;
+    int count = 0;
+    /* Add Windows-style overrides */
+    snprintf(overrides[oidx], 512, "PATH=C:\\Windows\\System32;C:\\Windows");
+    g_filtered_environ[count++] = overrides[oidx++];
+    snprintf(overrides[oidx], 512, "PROMPT=$P$G");
+    g_filtered_environ[count++] = overrides[oidx++];
+    snprintf(overrides[oidx], 512, "COMSPEC=C:\\Windows\\System32\\cmd.exe");
+    g_filtered_environ[count++] = overrides[oidx++];
+    snprintf(overrides[oidx], 512, "TEMP=C:\\Windows\\Temp");
+    g_filtered_environ[count++] = overrides[oidx++];
+    snprintf(overrides[oidx], 512, "TMP=C:\\Windows\\Temp");
+    g_filtered_environ[count++] = overrides[oidx++];
+    snprintf(overrides[oidx], 512, "SYSTEMROOT=C:\\Windows");
+    g_filtered_environ[count++] = overrides[oidx++];
+    snprintf(overrides[oidx], 512, "WINDIR=C:\\Windows");
+    g_filtered_environ[count++] = overrides[oidx++];
+    snprintf(overrides[oidx], 512, "SYSTEMDRIVE=C:");
+    g_filtered_environ[count++] = overrides[oidx++];
+    snprintf(overrides[oidx], 512, "HOMEDRIVE=C:");
+    g_filtered_environ[count++] = overrides[oidx++];
+    snprintf(overrides[oidx], 512, "HOMEPATH=\\Users\\Administrator");
+    g_filtered_environ[count++] = overrides[oidx++];
+    snprintf(overrides[oidx], 512, "USERPROFILE=C:\\Users\\Administrator");
+    g_filtered_environ[count++] = overrides[oidx++];
+    snprintf(overrides[oidx], 512, "USER=Administrator");
+    g_filtered_environ[count++] = overrides[oidx++];
+    snprintf(overrides[oidx], 512, "USERNAME=Administrator");
+    g_filtered_environ[count++] = overrides[oidx++];
+    snprintf(overrides[oidx], 512, "APPDATA=C:\\Users\\Administrator\\AppData\\Roaming");
+    g_filtered_environ[count++] = overrides[oidx++];
+    snprintf(overrides[oidx], 512, "LOCALAPPDATA=C:\\Users\\Administrator\\AppData\\Local");
+    g_filtered_environ[count++] = overrides[oidx++];
+    snprintf(overrides[oidx], 512, "OS=Windows_NT");
+    g_filtered_environ[count++] = overrides[oidx++];
+    /* Copy non-skipped host vars */
+    for (char** e = environ; *e && count < 510; e++) {
+        const char* eq = strchr(*e, '=');
+        if (!eq) continue;
+        size_t namelen = (size_t)(eq - *e);
+        int skip = 0;
+        for (const char** s = skip_vars; *s; s++) {
+            if (strlen(*s) == namelen && strncmp(*e, *s, namelen) == 0) {
+                skip = 1;
+                break;
+            }
+        }
+        if (!skip) g_filtered_environ[count++] = *e;
+    }
+    g_filtered_environ[count] = NULL;
+}
+
+char** _o__get_initial_narrow_environment(void) {
+    build_filtered_environ();
+    return g_filtered_environ;
+}
+
+char*** _o___p__environ(void) {
+    build_filtered_environ();
+    static char** ptr = NULL;
+    ptr = g_filtered_environ;
+    return &ptr;
+}
 char* _o__get_home_dir(void) {
-    const char* h = getenv("HOME");
-    return h ? (char*)h : "/";
+    return "C:\\Users\\Administrator";
 }
 
 int* _o___p___argc(void) {
     static int fake_argc = 1;
-    fprintf(stderr, "[trace] _o___p___argc returning argc=%d\n", fake_argc);
     return &fake_argc;
 }
 
 char*** _o___p___argv(void) {
     static char* argv0[] = { "cmd.exe", NULL };
     static char** fake_argv[2] = { argv0, NULL };
-    fprintf(stderr, "[trace] _o___p___argv returning argv[0]='%s'\n", fake_argv[0] ? fake_argv[0][0] : "(null)");
     return fake_argv;
 }
 
@@ -500,7 +631,6 @@ void _o__cexit(void) { }
 void _o__c_exit(void) { }
 void _c_exit(void) { }
 void _o_exit(int c) {
-    fprintf(stderr, "[exit] _o_exit(%d) caller=%p\n", c, __builtin_return_address(0));
     exit(c);
 }
 void _o__exit(int c) { _exit(c); }
@@ -541,7 +671,6 @@ void _o_qsort(void* base, size_t n, size_t s,
 int _o_rand(void) { return rand(); }
 void _o_srand(unsigned int s) { srand(s); }
 int _o__set_app_type(int t) {
-    fprintf(stderr, "[trace] _o__set_app_type type=%d\n", t);
     (void)t; return 0;
 }
 void _o__set_fmode(int m) { (void)m; }
@@ -557,11 +686,9 @@ int _register_thread_local_exe_atexit_callback(void* a) { (void)a; return 0; }
 
 // CRT init - called before main; safe no-ops
 void _initterm(void** s, void** e) {
-    fprintf(stderr, "[trace] _initterm s=%p e=%p count=%d\n", (void*)s, (void*)e, (int)(e - s));
     if (s && e) {
         for (void** p = s; p < e; p++) {
             if (*p && *p != (void*)0xcc) {
-                fprintf(stderr, "[trace] _initterm calling %p\n", *p);
                 void (*fn)(void) = (void(*)(void))*p;
                 fn();
             }
@@ -569,11 +696,9 @@ void _initterm(void** s, void** e) {
     }
 }
 int  _initterm_e(void** s, void** e) {
-    fprintf(stderr, "[trace] _initterm_e s=%p e=%p count=%d\n", (void*)s, (void*)e, (int)(e - s));
     if (s && e) {
         for (void** p = s; p < e; p++) {
             if (*p && *p != (void*)0xcc) {
-                fprintf(stderr, "[trace] _initterm_e calling %p\n", *p);
                 int (*fn)(void) = (int(*)(void))*p;
                 int r = fn();
                 if (r != 0) return r;
@@ -610,15 +735,28 @@ CONTEXT** __current_exception_context(void) {
 }
 
 int __CxxFrameHandler3(void* r, void* h, void* c, void* d) {
+    /* Return ExceptionContinueSearch (0) to let the exception propagate
+     * up the handler chain.  This is the correct default for most SEH
+     * exceptions in MSVC codegen: the frame handler doesn't know about
+     * this particular exception, so it passes it to the next handler. */
     (void)r; (void)h; (void)c; (void)d;
-    return 0;
+    return 0; /* ExceptionContinueSearch */
 }
 
 void _CxxThrowException(void* obj, void* t) {
     (void)obj; (void)t;
 }
 
-void _local_unwind(void* f, void* d) { (void)f; (void)d; }
+void _local_unwind(void* f, void* d) {
+    /* Minimal SEH unwind stub.  On Windows x64, _local_unwind walks the
+     * frame chain from the current frame to the target frame 'f', calling
+     * __finally blocks along the way.  Since we don't have pdata/xdata
+     * unwind info on Linux, just return and let the normal C unwinding
+     * handle cleanup.  Returning without doing anything is safe here
+     * because the PE code's __finally blocks are implemented as normal
+     * function calls in the MSVC codegen. */
+    (void)f; (void)d;
+}
 
 /* ms_abi implementations of __intrinsic_setjmp/longjmp that bypass
    trampolines and glibc entirely, using MSVC's _JUMP_BUFFER layout:

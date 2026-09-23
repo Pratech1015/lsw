@@ -49,9 +49,13 @@ BOOL win32_delete_file(const char*);
 BOOL win32_move_file(const char*,const char*);
 BOOL win32_copy_file(const char*,const char*,BOOL);
 DWORD win32_get_file_attributes(const char*);
+DWORD GetFileAttributesW_impl(const wchar_t*);
 BOOL win32_set_file_attributes(const char*,DWORD);
 BOOL win32_set_current_directory(const char*);
 DWORD win32_get_current_directory(DWORD,char*);
+BOOL SetCurrentDirectoryW_impl(const wchar_t*);
+DWORD GetCurrentDirectoryW(DWORD,wchar_t*);
+DWORD GetEnvironmentVariableW(const wchar_t*,wchar_t*,DWORD);
 BOOL win32_alloc_console(void); BOOL win32_free_console(void);
 BOOL win32_set_console_title(const char*);
 DWORD win32_get_console_title(char*,DWORD);
@@ -397,11 +401,11 @@ static const API_ENTRY g_api_table[] = {
     {"kernel32.dll","CopyFileExW",(void*)CopyFileExW},
     {"kernel32.dll","SetConsoleInputExeNameW",(void*)SetConsoleInputExeNameW},
     {"kernel32.dll","GetFileAttributesA",(void*)win32_get_file_attributes},
-    {"kernel32.dll","GetFileAttributesW",(void*)win32_get_file_attributes},
+    {"kernel32.dll","GetFileAttributesW",(void*)GetFileAttributesW_impl},
     {"kernel32.dll","SetFileAttributesA",(void*)win32_set_file_attributes},
     {"kernel32.dll","SetFileAttributesW",(void*)win32_set_file_attributes},
     {"kernel32.dll","SetCurrentDirectoryA",(void*)win32_set_current_directory},
-    {"kernel32.dll","SetCurrentDirectoryW",(void*)win32_set_current_directory},
+    {"kernel32.dll","SetCurrentDirectoryW",(void*)SetCurrentDirectoryW_impl},
     {"kernel32.dll","GetCurrentDirectoryA",(void*)win32_get_current_directory},
     {"kernel32.dll","GetCurrentDirectoryW",(void*)win32_get_current_directory},
     {"kernel32.dll","AllocConsole",(void*)win32_alloc_console},
@@ -474,7 +478,7 @@ static const API_ENTRY g_api_table[] = {
     {"kernel32.dll","GetSystemInfo",(void*)win32_get_system_info},
     {"kernel32.dll","GetNativeSystemInfo",(void*)win32_get_system_info},
     {"kernel32.dll","GetEnvironmentVariableA",(void*)win32_get_environment_variable},
-    {"kernel32.dll","GetEnvironmentVariableW",(void*)win32_get_environment_variable},
+    {"kernel32.dll","GetEnvironmentVariableW",(void*)GetEnvironmentVariableW},
     {"kernel32.dll","SetEnvironmentVariableA",(void*)win32_set_environment_variable},
     {"kernel32.dll","SetEnvironmentVariableW",(void*)win32_set_environment_variable},
     {"kernel32.dll","GetModuleHandleA",(void*)win32_get_module_handle},

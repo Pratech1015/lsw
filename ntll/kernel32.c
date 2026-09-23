@@ -15,15 +15,24 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <pthread.h>
+#include <limits.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <wctype.h>
 
 #include "ntll.h"
 
 extern wchar_t g_cmdline[4096];
 extern void* g_procparams;
+char* g_image_path = NULL;
 
 #define WINDOWS_TICK ((uint64_t)10000000)
 #define SEC_TO_UNIX_EPOCH ((uint64_t)11644473600LL)
 #define ERROR_FILE_NOT_FOUND 0x02
+#define FILE_ATTRIBUTE_READONLY  0x0001
+#define FILE_ATTRIBUTE_HIDDEN    0x0002
+#define FILE_ATTRIBUTE_DIRECTORY 0x0010
+#define FILE_ATTRIBUTE_NORMAL    0x0080
 
 static DWORD g_last_error = 0;
 static pthread_mutex_t g_error_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -65,7 +74,7 @@ HANDLE win32_handle_alloc(int linux_fd) {
         if (g_handle_table[i] == -1) {
             g_handle_table[i] = linux_fd;
             pthread_mutex_unlock(&g_handle_lock);
-            return (HANDLE)(0x100 | (HANDLE)i);
+            return (HANDLE)(uintptr_t)(0x100 | i);
         }
     }
     pthread_mutex_unlock(&g_handle_lock);
@@ -73,13 +82,13 @@ HANDLE win32_handle_alloc(int linux_fd) {
 }
 
 static int handle_lookup(HANDLE h) {
-    int slot = (int)(h & 0xFFF);
+    int slot = (int)((uintptr_t)h & 0xFFF);
     if (slot < 0 || slot >= MAX_WIN_HANDLES) return -1;
     return g_handle_table[slot];
 }
 
 static void handle_free(HANDLE h) {
-    int slot = (int)(h & 0xFFF);
+    int slot = (int)((uintptr_t)h & 0xFFF);
     if (slot >= 0 && slot < MAX_WIN_HANDLES) g_handle_table[slot] = -1;
 }
 
@@ -91,11 +100,148 @@ static void ensure_handles(void) {
     }
 }
 
+// Windows CWD stored as UTF-16LE (2-byte units)
+static uint16_t g_windows_cwd[MAX_PATH];
+static int g_cwd_initialized = 0;
+static void ensure_cwd_init(void) {
+    if (!g_cwd_initialized) {
+        g_cwd_initialized = 1;
+        g_windows_cwd[0] = 'C';
+        g_windows_cwd[1] = ':';
+        g_windows_cwd[2] = '\\';
+        g_windows_cwd[3] = 0;
+    }
+}
+
+BOOL SetCurrentDirectoryW_impl(const wchar_t* wpath) {
+    if (!wpath) { win32_set_last_error(87); return FALSE; }
+    const uint16_t* src = (const uint16_t*)wpath;
+    size_t len = 0;
+    while (src[len]) { len++; }
+    if (len >= MAX_PATH) len = MAX_PATH - 1;
+    memcpy(g_windows_cwd, src, len * sizeof(uint16_t));
+    g_windows_cwd[len] = 0;
+    return TRUE;
+}
+
+DWORD GetCurrentDirectoryW(DWORD len, wchar_t* buf) {
+    ensure_cwd_init();
+    DWORD needed = 0;
+    const uint16_t* p = g_windows_cwd;
+    while (*p) { needed++; p++; }
+    if (buf && len > needed) {
+        uint16_t* wb = (uint16_t*)buf;
+        memcpy(wb, g_windows_cwd, (needed + 1) * sizeof(uint16_t));
+    }
+    return needed;
+}
+
+static int match_wildcard(const char* pattern, const char* name) {
+    const char* p = pattern;
+    const char* n = name;
+    const char* star_p = NULL;
+    const char* star_n = NULL;
+    while (*n) {
+        if (*p == '*') {
+            star_p = p++;
+            star_n = n;
+        } else if (*p == '?' || *p == *n) {
+            p++; n++;
+        } else if (star_p) {
+            p = star_p + 1;
+            n = ++star_n;
+        } else {
+            return 0;
+        }
+    }
+    while (*p == '*') p++;
+    return *p == 0;
+}
+
+// UTF-16LE ↔ UTF-8 conversion (Windows wchar_t = 2 bytes, Linux wchar_t = 4 bytes)
+int k32_utf16le_to_utf8(const void* wide_, char* narrow, size_t max_out) {
+    const uint16_t* wide = (const uint16_t*)wide_;
+    if (!wide || !narrow || max_out == 0) return 0;
+    size_t j = 0;
+    for (size_t i = 0; wide[i] && j < max_out - 1; i++) {
+        uint32_t cp = wide[i];
+        if (cp < 0x80) {
+            narrow[j++] = (char)cp;
+        } else if (cp < 0x800) {
+            if (j + 2 >= max_out) break;
+            narrow[j++] = (char)(0xC0 | (cp >> 6));
+            narrow[j++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            if (j + 3 >= max_out) break;
+            narrow[j++] = (char)(0xE0 | (cp >> 12));
+            narrow[j++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            narrow[j++] = (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    narrow[j] = 0;
+    return (int)j;
+}
+
+int k32_utf8_to_utf16le(const char* narrow, void* wide_, size_t max_out) {
+    uint16_t* wide = (uint16_t*)wide_;
+    if (!narrow || !wide || max_out == 0) return 0;
+    size_t j = 0;
+    for (size_t i = 0; narrow[i] && j < max_out - 1; i++) {
+        unsigned char c = (unsigned char)narrow[i];
+        if (c < 0x80) {
+            wide[j++] = c;
+        } else if ((c & 0xE0) == 0xC0) {
+            uint32_t cp = (c & 0x1F) << 6;
+            if (narrow[i+1]) cp |= (unsigned char)narrow[++i] & 0x3F;
+            wide[j++] = (uint16_t)cp;
+        } else if ((c & 0xF0) == 0xE0) {
+            uint32_t cp = (c & 0x0F) << 12;
+            if (narrow[i+1]) cp |= ((unsigned char)narrow[++i] & 0x3F) << 6;
+            if (narrow[i+1]) cp |= (unsigned char)narrow[++i] & 0x3F;
+            wide[j++] = (uint16_t)cp;
+        } else {
+            i += 2;
+            if (narrow[i]) i++;
+        }
+    }
+    wide[j] = 0;
+    return (int)j;
+}
+
 // Path conversion helpers (also exposed in ntll.h)
+
+const char* nt_get_system_root(void) {
+    static char sysroot[1024] = {0};
+    if (sysroot[0]) return sysroot;
+    const char* img = g_image_path;
+    if (!img) { strcpy(sysroot, "/var/lib/lsw/distros/windows-11/rootfs"); return sysroot; }
+    const char* rootfs = strstr(img, "/rootfs/");
+    if (rootfs) {
+        size_t len = (size_t)(rootfs - img + 8);  /* include "/rootfs/" */
+        if (len >= sizeof(sysroot)) len = sizeof(sysroot) - 1;
+        memcpy(sysroot, img, len);
+        sysroot[len] = 0;
+    } else {
+        strcpy(sysroot, "/var/lib/lsw/distros/windows-11/rootfs");
+    }
+    return sysroot;
+}
+
+const char* nt_get_windows_dir(void) {
+    static char windir[1024] = {0};
+    if (!windir[0]) snprintf(windir, sizeof(windir), "%s/Windows", nt_get_system_root());
+    return windir;
+}
+
+const char* nt_get_system32_dir(void) {
+    static char sys32[1024] = {0};
+    if (!sys32[0]) snprintf(sys32, sizeof(sys32), "%s/Windows/System32", nt_get_system_root());
+    return sys32;
+}
+
 int nt_to_unix_path(const char* nt_path, char* unix_path, int max_len) {
     const char* system_root = nt_get_system_root();
     char buffer[MAX_PATH * 4];
-
     if (nt_path[0] >= 'A' && nt_path[0] <= 'Z' && nt_path[1] == ':') {
         char mounts[1024];
         if (nt_mount_lookup((char)(nt_path[0] - 'A' + 'a'), mounts, sizeof(mounts)) == 0) {
@@ -108,66 +254,27 @@ int nt_to_unix_path(const char* nt_path, char* unix_path, int max_len) {
         snprintf(buffer, sizeof(buffer), "%s/drive_c/share%s", system_root, nt_path + 2);
     } else if (nt_path[0] == '\\') {
         snprintf(buffer, sizeof(buffer), "%s/drive_c/%s", system_root, nt_path + 1);
-    } else if (strncmp(nt_path, "C:", 2) == 0) {
-        snprintf(buffer, sizeof(buffer), "%s/drive_c/%s", system_root, nt_path + 3);
     } else {
         snprintf(buffer, sizeof(buffer), "%s", nt_path);
     }
-
-    for (char* p = buffer; *p; p++) {
-        if (*p == '\\') *p = '/';
-    }
-
+    for (char* p = buffer; *p; p++) { if (*p == '\\') *p = '/'; }
     if (max_len <= 0) return -1;
     strncpy(unix_path, buffer, (size_t)max_len - 1);
     unix_path[max_len - 1] = '\0';
     return 0;
 }
 
-int unix_to_nt_path(const char* unix_path, char* nt_path, int max_len) {
+int unix_to_nt_path(const char* unix, char* nt, int max_len) {
     const char* system_root = nt_get_system_root();
-    size_t sr_len = strlen(system_root);
-
-    if (strncmp(unix_path, system_root, sr_len) == 0 &&
-        unix_path[sr_len] == '/') {
-        if (strncmp(unix_path + sr_len + 1, "drive_c", 7) == 0) {
-            snprintf(nt_path, (size_t)max_len, "C:\\%s", unix_path + sr_len + 9);
-        } else if (strncmp(unix_path + sr_len + 1, "drive_d", 7) == 0) {
-            snprintf(nt_path, (size_t)max_len, "D:\\%s", unix_path + sr_len + 9);
-        } else {
-            snprintf(nt_path, (size_t)max_len, "\\%s", unix_path + sr_len + 1);
-        }
-    } else if (unix_path[0] == '/') {
-        /* host mounts (D: -> /, ...) */
-        char m[1024];
-        int mapped = 0;
-        for (char d = 'a'; d <= 'z' && !mapped; d++) {
-            if (nt_mount_lookup(d, m, sizeof(m)) != 0) continue;
-            size_t ml = strlen(m);
-            int root_mount = (ml == 1 && m[0] == '/');
-            if (strncmp(unix_path, m, ml) == 0 &&
-                (root_mount || unix_path[ml] == '/' || unix_path[ml] == '\0')) {
-                const char* rest = root_mount ? unix_path + ml : (unix_path[ml] ? unix_path + ml + 1 : "");
-                snprintf(nt_path, (size_t)max_len, "%c:\\%s", (char)(d - 'a' + 'A'), rest);
-                mapped = 1;
-            }
-        }
-        if (!mapped) {
-            snprintf(nt_path, (size_t)max_len, "%s", unix_path);
-        }
-    } else {
-        snprintf(nt_path, (size_t)max_len, "%s", unix_path);
+    const char* rel = unix;
+    if (strncmp(unix, system_root, strlen(system_root)) == 0) {
+        rel = unix + strlen(system_root);
+        while (*rel == '/') rel++;
     }
-
-    for (char* p = nt_path; *p; p++) {
-        if (*p == '/') *p = '\\';
-    }
+    snprintf(nt, max_len, "C:\\%s", rel);
+    for (char* p = nt; *p; p++) { if (*p == '/') *p = '\\'; }
     return 0;
 }
-
-const char* nt_get_system_root(void)  { return "/var/lib/lsw/root"; }
-const char* nt_get_windows_dir(void)  { return "/var/lib/lsw/root/Windows"; }
-const char* nt_get_system32_dir(void) { return "/var/lib/lsw/root/Windows/System32"; }
 
 // ---- File I/O ----
 
@@ -203,12 +310,10 @@ BOOL win32_read_file(HANDLE handle, void* buf, DWORD len, DWORD* bytes_read,
     (void)overlapped;
     ensure_handles();
     int fd = handle_lookup(handle);
-    fprintf(stderr, "[trace] ReadFile handle=%p fd=%d len=%u\n", (void*)(uintptr_t)handle, fd, len);
     if (fd < 0) { win32_set_last_error(6); return FALSE; }
     ssize_t n = read(fd, buf, len);
     if (n < 0) { win32_set_last_error(errno_to_win32(errno)); return FALSE; }
     if (bytes_read) *bytes_read = (DWORD)n;
-    fprintf(stderr, "[trace] ReadFile got %zd bytes\n", n);
     return TRUE;
 }
 
@@ -217,7 +322,6 @@ BOOL win32_write_file(HANDLE handle, void* buf, DWORD len, DWORD* written,
     (void)overlapped;
     ensure_handles();
     int fd = handle_lookup(handle);
-    fprintf(stderr, "[dbg] WriteFile handle=%p fd=%d len=%u\n", (void*)(uintptr_t)handle, fd, len);
     if (fd < 0) { win32_set_last_error(6); return FALSE; }
     ssize_t n = write(fd, buf, len);
     if (n < 0) { win32_set_last_error(errno_to_win32(errno)); return FALSE; }
@@ -403,8 +507,24 @@ DWORD win32_get_file_attributes(const char* path) {
         win32_set_last_error(errno_to_win32(errno));
         return 0xFFFFFFFF;
     }
-    if (S_ISDIR(st.st_mode)) return 0x10; // FILE_ATTRIBUTE_DIRECTORY
-    return 0x80; // FILE_ATTRIBUTE_NORMAL
+    if (S_ISDIR(st.st_mode)) return FILE_ATTRIBUTE_DIRECTORY;
+    return FILE_ATTRIBUTE_NORMAL;
+}
+
+DWORD GetFileAttributesW_impl(const wchar_t* wpath) {
+    if (!wpath) { win32_set_last_error(87); return 0xFFFFFFFF; }
+    char upath[2048];
+    k32_utf16le_to_utf8(wpath, upath, sizeof(upath));
+    for (char* s = upath; *s; s++) { if (*s == '\\') *s = '/'; }
+    char unix_path[MAX_PATH * 4];
+    nt_to_unix_path(upath, unix_path, sizeof(unix_path));
+    struct stat st;
+    if (stat(unix_path, &st) != 0) {
+        win32_set_last_error(errno_to_win32(errno));
+        return 0xFFFFFFFF;
+    }
+    if (S_ISDIR(st.st_mode)) return FILE_ATTRIBUTE_DIRECTORY;
+    return FILE_ATTRIBUTE_NORMAL;
 }
 
 BOOL win32_set_file_attributes(const char* path, DWORD attrs) {
@@ -419,6 +539,9 @@ BOOL win32_set_current_directory(const char* path) {
         win32_set_last_error(errno_to_win32(errno));
         return FALSE;
     }
+    /* also update the Windows CWD */
+    ensure_cwd_init();
+    k32_utf8_to_utf16le(path, g_windows_cwd, MAX_PATH);
     return TRUE;
 }
 
@@ -450,7 +573,6 @@ BOOL win32_read_console_input(HANDLE c, void* recs, DWORD count, DWORD* read) {
 BOOL win32_write_console(HANDLE c, void* buf, DWORD len,
                         DWORD* written, void* reserved) {
     (void)c; (void)reserved;
-    fprintf(stderr, "[trace] WriteConsoleW handle=%p len=%u\n", (void*)(uintptr_t)c, len);
     const uint16_t* wbuf = (const uint16_t*)buf;
     for (DWORD i = 0; i < len; i++) {
         uint16_t ch = wbuf[i];
@@ -469,7 +591,6 @@ BOOL win32_write_console(HANDLE c, void* buf, DWORD len,
 }
 BOOL win32_set_console_mode(HANDLE c, DWORD mode) { (void)c; (void)mode; return TRUE; }
 BOOL win32_get_console_mode(HANDLE c, DWORD* mode) {
-    fprintf(stderr, "[trace] GetConsoleMode(%p)\n", (void*)(uintptr_t)c);
     (void)c; if (mode) *mode = 7; return TRUE;
 }
 BOOL win32_get_console_screen_buffer_info(HANDLE c, void* info) {
@@ -714,6 +835,58 @@ DWORD win32_get_environment_variable(const char* name, char* buf, DWORD size) {
     return 0;
 }
 
+DWORD GetEnvironmentVariableW(const wchar_t* wname, wchar_t* buf, DWORD size) {
+    if (!wname) { win32_set_last_error(87); return 0; }
+    char name[256];
+    k32_utf16le_to_utf8(wname, name, sizeof(name));
+
+    /* Windows path overrides for key environment variables */
+    const char* rootfs = nt_get_system_root();
+    const char* val = NULL;
+    char override[1024] = {0};
+
+    if (strcasecmp(name, "PATH") == 0) {
+        snprintf(override, sizeof(override),
+                 "%s/drive_c/Windows/System32;%s/drive_c/Windows;"
+                 "%s/drive_c/Windows/System32/WindowsPowerShell/v1.0;"
+                 "%s/drive_c", rootfs, rootfs, rootfs, rootfs);
+        val = override;
+    } else if (strcasecmp(name, "PROMPT") == 0) {
+        val = "$P$G";
+    } else if (strcasecmp(name, "COMSPEC") == 0) {
+        snprintf(override, sizeof(override), "%s/drive_c/Windows/System32/cmd.exe", rootfs);
+        val = override;
+    } else if (strcasecmp(name, "TEMP") == 0 || strcasecmp(name, "TMP") == 0) {
+        snprintf(override, sizeof(override), "%s/drive_c/Windows/Temp", rootfs);
+        val = override;
+    } else if (strcasecmp(name, "SYSTEMROOT") == 0 || strcasecmp(name, "WINDIR") == 0) {
+        snprintf(override, sizeof(override), "%s", rootfs);
+        val = override;
+    } else if (strcasecmp(name, "SYSTEMDRIVE") == 0) {
+        val = "C:";
+    } else if (strcasecmp(name, "HOMEDRIVE") == 0) {
+        val = "C:";
+    } else if (strcasecmp(name, "HOMEPATH") == 0) {
+        snprintf(override, sizeof(override), "\\Users\\%s", getenv("USER") ? getenv("USER") : "user");
+        val = override;
+    } else if (strcasecmp(name, "USERPROFILE") == 0) {
+        snprintf(override, sizeof(override), "%s/drive_c/Users/%s",
+                 rootfs, getenv("USER") ? getenv("USER") : "user");
+        val = override;
+    } else {
+        val = getenv(name);
+    }
+
+    if (!val) { win32_set_last_error(203); return 0; }
+    DWORD needed = (DWORD)strlen(val);
+    if (buf && size > needed) {
+        k32_utf8_to_utf16le(val, buf, (size_t)size);
+        return needed;
+    }
+    win32_set_last_error(ERROR_FILE_NOT_FOUND);
+    return needed;
+}
+
 BOOL win32_set_environment_variable(const char* name, const char* value) {
     return setenv(name, value ? value : "", 1) == 0;
 }
@@ -879,8 +1052,73 @@ HANDLE GetCurrentProcess(void) { return (HANDLE)(uintptr_t)-1; }
 BOOL CreateProcessW(const void* app, void* cmd, void* pa, void* ta,
                     BOOL inherit, DWORD flags, void* env, void* cwd,
                     void* si, void* pi) {
-    (void)app; (void)cmd; (void)pa; (void)ta; (void)inherit;
-    (void)flags; (void)env; (void)cwd; (void)si; (void)pi;
+    (void)pa; (void)ta; (void)inherit; (void)flags; (void)env;
+    (void)si; (void)pi;
+    /* Extract the executable name from the command line or app parameter */
+    char exe_path[2048] = {0};
+    const wchar_t* wapp = (const wchar_t*)app;
+    if (wapp) {
+        k32_utf16le_to_utf8(wapp, exe_path, sizeof(exe_path));
+    } else if (cmd) {
+        const wchar_t* wcmd = (const wchar_t*)cmd;
+        char cmd_utf8[2048];
+        k32_utf16le_to_utf8(wcmd, cmd_utf8, sizeof(cmd_utf8));
+        /* skip leading spaces and quotes */
+        const char* p = cmd_utf8;
+        while (*p == ' ') p++;
+        if (*p == '"') {
+            p++;
+            const char* q = strchr(p, '"');
+            if (q) { size_t n = (size_t)(q - p); if (n >= sizeof(exe_path)) n = sizeof(exe_path)-1; memcpy(exe_path, p, n); exe_path[n] = 0; }
+            else snprintf(exe_path, sizeof(exe_path), "%s", p);
+        } else {
+            const char* q = strchr(p, ' ');
+            if (q) { size_t n = (size_t)(q - p); if (n >= sizeof(exe_path)) n = sizeof(exe_path)-1; memcpy(exe_path, p, n); exe_path[n] = 0; }
+            else snprintf(exe_path, sizeof(exe_path), "%s", p);
+        }
+    }
+    if (!exe_path[0]) return FALSE;
+
+    /* Convert NT path to Unix path */
+    char unix_path[MAX_PATH * 4];
+    nt_to_unix_path(exe_path, unix_path, sizeof(unix_path));
+
+    /* Build the command line as UTF-8 */
+    char cmdline_utf8[4096] = {0};
+    if (cmd) {
+        k32_utf16le_to_utf8(cmd, cmdline_utf8, sizeof(cmdline_utf8));
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* child process */
+        if (cwd) {
+            char cwd_utf8[2048];
+            k32_utf16le_to_utf8(cwd, cwd_utf8, sizeof(cwd_utf8));
+            char cwd_unix[MAX_PATH * 4];
+            nt_to_unix_path(cwd_utf8, cwd_unix, sizeof(cwd_unix));
+            chdir(cwd_unix);
+        }
+        /* Use /proc/self/exe (the runtime) to re-exec */
+        char runtime_path[1024];
+        ssize_t rl = readlink("/proc/self/exe", runtime_path, sizeof(runtime_path) - 1);
+        if (rl > 0) {
+            runtime_path[rl] = 0;
+            /* Build argv for the child: runtime <exe_path> <args...> */
+            execlp(runtime_path, runtime_path, unix_path, (char*)NULL);
+        }
+        /* fallback: try exec directly */
+        execlp(unix_path, unix_path, (char*)NULL);
+        _exit(127);
+    } else if (pid > 0) {
+        /* parent: return success with fake process info */
+        if (pi) {
+            uint64_t* pih = (uint64_t*)pi;
+            pih[0] = (uintptr_t)(HANDLE)(uintptr_t)pid; /* hProcess */
+            pih[1] = (uintptr_t)(HANDLE)(uintptr_t)pid; /* hThread */
+        }
+        return TRUE;
+    }
     return FALSE;
 }
 
@@ -915,12 +1153,11 @@ DWORD GetModuleFileNameW(HMODULE mod, wchar_t* buf, DWORD sz) {
     const char* path = getenv("LSW_MODULE_PATH");
     if (!path) path = "C:\\Windows\\System32\\cmd.exe";
     if (buf && sz > 0) {
-        size_t n = mbstowcs(buf, path, sz);
-        if (n == (size_t)-1) { buf[0] = L'\0'; return 0; }
-        if (n >= sz) n = sz - 1;
-        buf[n] = L'\0';
+        int n = k32_utf8_to_utf16le(path, buf, (size_t)sz);
+        if (n >= (int)sz) { buf[sz - 1] = 0; n = (int)sz - 1; }
+        return (DWORD)n;
     }
-    return strlen(path);
+    return (DWORD)strlen(path);
 }
 
 BOOL GetModuleHandleExW(DWORD flags, const wchar_t* name, HMODULE* mod) {
@@ -1015,7 +1252,6 @@ HANDLE GetStdHandle(DWORD n) {
         g_std_handles[2] = win32_handle_alloc(STDERR_FILENO);
         std_handles_initialized = 1;
     }
-    fprintf(stderr, "[trace] GetStdHandle(%u) = %p\n", n, (void*)(uintptr_t)g_std_handles[idx]);
     return g_std_handles[idx];
 }
 
@@ -1038,9 +1274,6 @@ void win32_init_peb_standard_handles(void) {
         *std_in  = (uintptr_t)g_std_handles[0];
         *std_out = (uintptr_t)g_std_handles[1];
         *std_err = (uintptr_t)g_std_handles[2];
-        fprintf(stderr, "[trace] PEB ConsoleHandle=%p ConsoleFlags=%u stdin=%p stdout=%p stderr=%p\n",
-                (void*)*con, (unsigned)*conflags,
-                (void*)*std_in, (void*)*std_out, (void*)*std_err);
     }
 }
 
@@ -1057,15 +1290,6 @@ BOOL ReadConsoleW(HANDLE h, void* buf, DWORD toread, DWORD* read, void* sr) {
         }
     }
     if (read) *read = count;
-    if (count > 0) {
-        fprintf(stderr, "[trace] ReadConsoleW toread=%u got %u chars U+%04X\n",
-                toread, count, (unsigned)wbuf[0]);
-        fprintf(stderr, "[trace]   hex:");
-        for (DWORD i = 0; i < count && i < 20; i++)
-            fprintf(stderr, " %04x", (unsigned)wbuf[i]);
-        fprintf(stderr, "\n");
-    } else
-        fprintf(stderr, "[trace] ReadConsoleW toread=%u EOF\n", toread);
     return count > 0;
 }
 
@@ -1096,13 +1320,14 @@ BOOL SetConsoleCtrlHandler(void* handler, BOOL add) {
 
 typedef struct { DIR* d; char pattern[512]; char base[1024]; int first; } FIND_CTX;
 
-HANDLE FindFirstFileW(const wchar_t* pattern, void* data) {
-    if (!pattern || !data) return INVALID_HANDLE_VALUE;
+HANDLE FindFirstFileW(const wchar_t* wpattern, void* data) {
+    if (!wpattern || !data) return INVALID_HANDLE_VALUE;
     char upath[2048];
-    wcstombs(upath, pattern, sizeof(upath));
-    // extract directory and pattern
+    k32_utf16le_to_utf8(wpattern, upath, sizeof(upath));
+    /* convert backslashes to forward slashes */
+    for (char* p = upath; *p; p++) { if (*p == '\\') *p = '/'; }
+    /* extract directory and pattern */
     char* sl = strrchr(upath, '/');
-    if (!sl) sl = strrchr(upath, '\\');
     char dirpath[2048] = ".";
     char match[512] = "*";
     if (sl) {
@@ -1114,24 +1339,30 @@ HANDLE FindFirstFileW(const wchar_t* pattern, void* data) {
     }
     DIR* d = opendir(dirpath);
     if (!d) return INVALID_HANDLE_VALUE;
-    FIND_CTX* ctx = calloc(1, sizeof(FIND_CTX));
+    FIND_CTX* ctx = (FIND_CTX*)data;
     ctx->d = d;
     ctx->first = 1;
     snprintf(ctx->pattern, sizeof(ctx->pattern), "%s", match);
     snprintf(ctx->base, sizeof(ctx->base), "%s", dirpath);
-    memcpy(data, ctx, sizeof(FIND_CTX));
-    free(ctx);
-    ctx = (FIND_CTX*)data;
-    ctx->d = d;
-    ctx->first = 1;
-    // find first match
+    /* find first match */
     struct dirent* e;
     while ((e = readdir(d)) != NULL) {
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-        // simple pattern match
-        if (strcmp(match, "*") == 0 || strstr(e->d_name, match)) {
-            wchar_t* wname = (wchar_t*)((char*)data + 44);
-            mbstowcs(wname, e->d_name, 260);
+        if (match_wildcard(match, e->d_name)) {
+            uint16_t* wname = (uint16_t*)((char*)data + 44);
+            k32_utf8_to_utf16le(e->d_name, wname, 260);
+            /* fill file attributes */
+            DWORD* attrs = (DWORD*)((char*)data);
+            struct stat st;
+            char fullpath[4096];
+            snprintf(fullpath, sizeof(fullpath), "%s/%s", dirpath, e->d_name);
+            *attrs = 0x80;
+            if (stat(fullpath, &st) == 0) {
+                if (S_ISDIR(st.st_mode)) *attrs = FILE_ATTRIBUTE_DIRECTORY;
+            }
+            /* fill file size */
+            uint64_t* fsize = (uint64_t*)((char*)data + 32);
+            *fsize = (S_ISREG(st.st_mode)) ? (uint64_t)st.st_size : 0;
             return (HANDLE)(uintptr_t)1;
         }
     }
@@ -1146,9 +1377,21 @@ BOOL FindNextFileW(HANDLE h, void* data) {
     struct dirent* e;
     while ((e = readdir(ctx->d)) != NULL) {
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-        wchar_t* wname = (wchar_t*)((char*)data + 44);
-        mbstowcs(wname, e->d_name, 260);
-        return TRUE;
+        if (match_wildcard(ctx->pattern, e->d_name)) {
+            uint16_t* wname = (uint16_t*)((char*)data + 44);
+            k32_utf8_to_utf16le(e->d_name, wname, 260);
+            DWORD* attrs = (DWORD*)((char*)data);
+            struct stat st;
+            char fullpath[4096];
+            snprintf(fullpath, sizeof(fullpath), "%s/%s", ctx->base, e->d_name);
+            *attrs = 0x80;
+            if (stat(fullpath, &st) == 0) {
+                if (S_ISDIR(st.st_mode)) *attrs = FILE_ATTRIBUTE_DIRECTORY;
+            }
+            uint64_t* fsize = (uint64_t*)((char*)data + 32);
+            *fsize = (S_ISREG(st.st_mode)) ? (uint64_t)st.st_size : 0;
+            return TRUE;
+        }
     }
     closedir(ctx->d);
     ctx->d = NULL;
@@ -1156,7 +1399,7 @@ BOOL FindNextFileW(HANDLE h, void* data) {
 }
 
 BOOL FindClose(HANDLE h) { (void)h; return TRUE; }
-BOOL FindFirstFileExW(const wchar_t* a, int b, void* c) { return FindFirstFileW(a, c); }
+HANDLE FindFirstFileExW(const wchar_t* a, int b, void* c) { (void)b; return FindFirstFileW(a, c); }
 BOOL FindFirstStreamWStub(const wchar_t* a, int b, void* c, DWORD d) {
     (void)a; (void)b; (void)c; (void)d; return FALSE;
 }
@@ -1169,10 +1412,6 @@ BOOL FindNextStreamWStub(HANDLE a, void* b) { (void)a; (void)b; return FALSE; }
 #define FILE_TYPE_CHAR          0x0002
 #define FILE_TYPE_PIPE          0x0003
 #define FILE_TYPE_REMOTE        0x8000
-#define FILE_ATTRIBUTE_READONLY  0x0001
-#define FILE_ATTRIBUTE_HIDDEN    0x0002
-#define FILE_ATTRIBUTE_DIRECTORY 0x0010
-#define FILE_ATTRIBUTE_NORMAL    0x0080
 
 // CRT standard fds 0/1/2 map directly to Linux stdin/stdout/stderr; the
 // console emulation presents them as the process console (FILE_TYPE_CHAR).
@@ -1205,7 +1444,8 @@ BOOL GetFileAttributesExW(const wchar_t* p, int cls, void* data) {
     (void)cls;
     if (!p || !data) return FALSE;
     char upath[2048];
-    wcstombs(upath, p, sizeof(upath));
+    k32_utf16le_to_utf8(p, upath, sizeof(upath));
+    for (char* s = upath; *s; s++) { if (*s == '\\') *s = '/'; }
     struct stat st;
     if (stat(upath, &st) != 0) return FALSE;
     memset(data, 0, 40);
@@ -1222,28 +1462,82 @@ BOOL GetFileSecurityW(const wchar_t* p, DWORD cls, void* sd, DWORD sz, DWORD* ne
 
 DWORD SearchPathW(const wchar_t* dir, const wchar_t* file, const wchar_t* ext,
                   DWORD bufsz, wchar_t* buf, wchar_t** fpart) {
-    (void)dir; (void)ext; (void)bufsz; (void)fpart;
-    if (!buf) return 0;
-    if (file) {
-        wcscpy(buf, file);
-        if (fpart) *fpart = buf;
-        return (DWORD)wcslen(buf);
+    if (!file) { if (buf && bufsz > 0) buf[0] = 0; return 0; }
+    char ufile[2048];
+    k32_utf16le_to_utf8(file, ufile, sizeof(ufile));
+    const char* rootfs = nt_get_system_root();
+    /* Search directories: explicit dir, System32, drive_c root */
+    const char* search_dirs[] = {
+        NULL, /* explicit dir if provided */
+        NULL, /* resolved explicit dir */
+    };
+    char dir_utf8[2048] = {0};
+    char dir_unix[MAX_PATH * 4] = {0};
+    if (dir) {
+        k32_utf16le_to_utf8(dir, dir_utf8, sizeof(dir_utf8));
+        nt_to_unix_path(dir_utf8, dir_unix, sizeof(dir_unix));
+        search_dirs[0] = dir_unix;
     }
-    return 0;
+    static char sys32_path[1024];
+    static char drive_c_path[1024];
+    snprintf(sys32_path, sizeof(sys32_path), "%s/Windows/System32", rootfs);
+    snprintf(drive_c_path, sizeof(drive_c_path), "%s/drive_c", rootfs);
+    search_dirs[0] = dir ? dir_unix : sys32_path;
+    search_dirs[1] = drive_c_path;
+
+    char found[MAX_PATH * 4] = {0};
+    for (int i = 0; i < 2; i++) {
+        if (!search_dirs[i]) continue;
+        char candidate[MAX_PATH * 4];
+        snprintf(candidate, sizeof(candidate), "%s/%s", search_dirs[i], ufile);
+        if (access(candidate, R_OK) == 0) {
+            snprintf(found, sizeof(found), "%s", candidate);
+            break;
+        }
+        /* also try with .exe extension */
+        if (ext) {
+            char uext[64];
+            k32_utf16le_to_utf8(ext, uext, sizeof(uext));
+            snprintf(candidate, sizeof(candidate), "%s/%s%s", search_dirs[i], ufile, uext);
+            if (access(candidate, R_OK) == 0) {
+                snprintf(found, sizeof(found), "%s", candidate);
+                break;
+            }
+        }
+    }
+    if (!found[0]) {
+        /* just return the file as-is */
+        snprintf(found, sizeof(found), "%s", ufile);
+    }
+    /* Convert back to NT path */
+    char nt_result[MAX_PATH];
+    unix_to_nt_path(found, nt_result, sizeof(nt_result));
+    if (buf && bufsz > 0) {
+        int n = k32_utf8_to_utf16le(nt_result, buf, (size_t)bufsz);
+        if (fpart) {
+            /* find last backslash in result for file part */
+            wchar_t* last = buf;
+            wchar_t* p = buf;
+            while (*p) { if (*p == L'\\') last = p + 1; p++; }
+            *fpart = last;
+        }
+        return (DWORD)n;
+    }
+    return (DWORD)strlen(nt_result);
 }
 
 BOOL GetVolumeInformationW(const wchar_t* root, wchar_t* label, DWORD lsz,
                            DWORD* serial, DWORD* maxcomp, DWORD* flags,
                            wchar_t* fsname, DWORD fsnsz) {
     (void)root; (void)serial; (void)maxcomp; (void)flags;
-    if (label && lsz > 0) label[0] = L'\0';
-    if (fsname && fsnsz > 0) wcscpy(fsname, L"NTFS");
+    if (label && lsz > 0) label[0] = 0;
+    if (fsname && fsnsz > 0) k32_utf8_to_utf16le("NTFS", fsname, (size_t)fsnsz);
     return TRUE;
 }
 
 BOOL GetVolumePathNameW(const wchar_t* file, wchar_t* vol, DWORD sz) {
     (void)file;
-    if (vol && sz > 0) wcscpy(vol, L"C:\\");
+    if (vol && sz > 0) k32_utf8_to_utf16le("C:\\", vol, (size_t)sz);
     return TRUE;
 }
 
@@ -1273,8 +1567,10 @@ BOOL SetFileTime(HANDLE h, void* c, void* a, void* w) {
 BOOL MoveFileExW(const wchar_t* a, const wchar_t* b, DWORD flags) {
     (void)flags;
     char ua[2048], ub[2048];
-    wcstombs(ua, a, sizeof(ua));
-    wcstombs(ub, b, sizeof(ub));
+    k32_utf16le_to_utf8(a, ua, sizeof(ua));
+    k32_utf16le_to_utf8(b, ub, sizeof(ub));
+    for (char* p = ua; *p; p++) if (*p == '\\') *p = '/';
+    for (char* p = ub; *p; p++) if (*p == '\\') *p = '/';
     return rename(ua, ub) == 0;
 }
 
@@ -1286,8 +1582,10 @@ BOOL MoveFileWithProgressW(const wchar_t* a, const wchar_t* b, void* prog, void*
 BOOL CopyFileW(const wchar_t* a, const wchar_t* b, BOOL fail) {
     (void)fail;
     char ua[2048], ub[2048];
-    wcstombs(ua, a, sizeof(ua));
-    wcstombs(ub, b, sizeof(ub));
+    k32_utf16le_to_utf8(a, ua, sizeof(ua));
+    k32_utf16le_to_utf8(b, ub, sizeof(ub));
+    for (char* p = ua; *p; p++) if (*p == '\\') *p = '/';
+    for (char* p = ub; *p; p++) if (*p == '\\') *p = '/';
     int in = open(ua, O_RDONLY);
     if (in < 0) return FALSE;
     int out = open(ub, O_WRONLY | O_CREAT | O_TRUNC, 0666);
@@ -1311,16 +1609,20 @@ void SetConsoleInputExeNameW(const wchar_t* name) {
 BOOL CreateHardLinkW(const wchar_t* a, const wchar_t* b, void* sa) {
     (void)sa;
     char ua[2048], ub[2048];
-    wcstombs(ua, a, sizeof(ua));
-    wcstombs(ub, b, sizeof(ub));
+    k32_utf16le_to_utf8(a, ua, sizeof(ua));
+    k32_utf16le_to_utf8(b, ub, sizeof(ub));
+    for (char* p = ua; *p; p++) if (*p == '\\') *p = '/';
+    for (char* p = ub; *p; p++) if (*p == '\\') *p = '/';
     return link(ub, ua) == 0;
 }
 
 BOOL CreateSymbolicLinkW(const wchar_t* a, const wchar_t* b, DWORD flags) {
     (void)flags;
     char ua[2048], ub[2048];
-    wcstombs(ua, a, sizeof(ua));
-    wcstombs(ub, b, sizeof(ub));
+    k32_utf16le_to_utf8(a, ua, sizeof(ua));
+    k32_utf16le_to_utf8(b, ub, sizeof(ub));
+    for (char* p = ua; *p; p++) if (*p == '\\') *p = '/';
+    for (char* p = ub; *p; p++) if (*p == '\\') *p = '/';
     return symlink(ub, ua) == 0;
 }
 
@@ -1328,18 +1630,52 @@ BOOL CreateSymbolicLinkW(const wchar_t* a, const wchar_t* b, DWORD flags) {
 
 DWORD GetFullPathNameW(const wchar_t* file, DWORD len, wchar_t* buf, wchar_t** part) {
     char ufile[2048], ubuf[4096];
-    wcstombs(ufile, file, sizeof(ufile));
-    if (buf) {
-        if (realpath(ufile, ubuf)) {
-            mbstowcs(buf, ubuf, len);
-            if (part) *part = buf;
-            return (DWORD)wcslen(buf);
+    if (file) k32_utf16le_to_utf8(file, ufile, sizeof(ufile));
+    else ufile[0] = 0;
+
+    /* Handle bare drive letter ("C") or drive letter with colon ("C:", "C:file") */
+    if (ufile[0] >= 'A' && ufile[0] <= 'Z' && (ufile[1] == '\0' || (ufile[1] == ':' && ufile[2] == '\0'))) {
+        if (buf) {
+            if (len < 4) { win32_set_last_error(122); return 4; }
+            uint16_t* wb = (uint16_t*)buf;
+            wb[0] = (uint16_t)ufile[0];
+            wb[1] = 0x003A;
+            wb[2] = 0x005C;
+            wb[3] = 0;
+            if (part) *part = buf + 3;
         }
-        wcscpy(buf, file);
-        if (part) *part = buf;
-        return (DWORD)wcslen(buf);
+        return 3;
     }
-    return (DWORD)wcslen(file);
+
+    char unix_path[MAX_PATH * 4];
+    nt_to_unix_path(ufile, unix_path, sizeof(unix_path));
+    if (buf) {
+        const char* drive_c = "/var/lib/lsw/distros/windows-11/rootfs/drive_c";
+        if (unix_path[0] != '/') {
+            char abs_path[4096];
+            snprintf(abs_path, sizeof(abs_path), "%s/%s", drive_c, unix_path);
+            if (realpath(abs_path, ubuf)) {
+                const char* rel = ubuf + strlen(drive_c);
+                if (*rel == '/') rel++;
+                char nt_result[MAX_PATH];
+                snprintf(nt_result, sizeof(nt_result), "C:\\%s", rel);
+                int n = k32_utf8_to_utf16le(nt_result, buf, (size_t)len);
+                if (part) *part = buf;
+                return (DWORD)n;
+            }
+        }
+        if (realpath(unix_path, ubuf)) {
+            char nt_result[MAX_PATH];
+            unix_to_nt_path(ubuf, nt_result, sizeof(nt_result));
+            int n = k32_utf8_to_utf16le(nt_result, buf, (size_t)len);
+            if (part) *part = buf;
+            return (DWORD)n;
+        }
+        int n = k32_utf8_to_utf16le(ufile, buf, (size_t)len);
+        if (part) *part = buf;
+        return (DWORD)n;
+    }
+    return (DWORD)k32_utf16le_to_utf8(file, NULL, 0);
 }
 
 static DWORD expand_single_variable(const char* var, char* out, size_t outsz) {
@@ -1381,9 +1717,9 @@ DWORD ExpandEnvironmentStringsA(const char* src, char* dst, DWORD len) {
 
 DWORD ExpandEnvironmentStringsW(const wchar_t* src, wchar_t* dst, DWORD len) {
     char usrc[4096], udst[4096];
-    wcstombs(usrc, src, sizeof(usrc));
+    k32_utf16le_to_utf8(src, usrc, sizeof(usrc));
     DWORD r = ExpandEnvironmentStringsA(usrc, udst, (DWORD)sizeof(udst));
-    if (dst) mbstowcs(dst, udst, len);
+    if (dst) k32_utf8_to_utf16le(udst, dst, (size_t)len);
     return r;
 }
 
@@ -1393,8 +1729,11 @@ wchar_t* GetEnvironmentStringsW(void) {
     extern char** environ;
     wchar_t* p = wblock;
     for (char** e = environ; *e; e++) {
-        mbstowcs(p, *e, 2048);
-        p += wcslen(p) + 1;
+        k32_utf8_to_utf16le(*e, p, 2048);
+        size_t slen = 0;
+        const uint16_t* up = (const uint16_t*)p;
+        while (up[slen]) slen++;
+        p += slen + 1;
     }
     *p = L'\0';
     return wblock;
@@ -1404,7 +1743,7 @@ BOOL FreeEnvironmentStringsW(wchar_t* e) { (void)e; return TRUE; }
 BOOL SetEnvironmentStringsW(wchar_t* e) { (void)e; return FALSE; }
 
 DWORD GetWindowsDirectoryW(wchar_t* buf, DWORD len) {
-    if (buf && len > 0) wcscpy(buf, L"C:\\Windows");
+    if (buf && len > 0) k32_utf8_to_utf16le("C:\\Windows", buf, (size_t)len);
     return 9;
 }
 
@@ -1459,10 +1798,19 @@ BOOL SystemTimeToFileTime(void* st, FILETIME* ft) {
 
 int CompareStringOrdinal(const wchar_t* a, int al, const wchar_t* b, int bl, BOOL ignore) {
     (void)ignore;
-    int cmp = wcsncmp(a, b, (size_t)(al < bl ? al : bl));
-    if (cmp != 0) return cmp < 0 ? 1 : 2;
-    if (al < bl) return 1;
-    if (al > bl) return 2;
+    const uint16_t* ua = (const uint16_t*)a;
+    const uint16_t* ub = (const uint16_t*)b;
+    int cmp = 0;
+    int len = al < bl ? al : bl;
+    for (int i = 0; i < len; i++) {
+        if (ua[i] != ub[i]) { cmp = (int)ua[i] - (int)ub[i]; break; }
+    }
+    if (cmp == 0) {
+        if (al < bl) cmp = -1;
+        else if (al > bl) cmp = 1;
+    }
+    if (cmp < 0) return 1;
+    if (cmp > 0) return 2;
     return 1;  // CSTR_EQUAL
 }
 
@@ -1479,14 +1827,14 @@ DWORD SetThreadLocale(DWORD loc) { (void)loc; return 0x0409; }
 BOOL GetTimeFormatW(int loc, DWORD fmt, void* st, const wchar_t* pat,
                     wchar_t* buf, int len) {
     (void)loc; (void)fmt; (void)st; (void)pat;
-    if (buf && len > 0) wcscpy(buf, L"00:00:00");
+    if (buf && len > 0) k32_utf8_to_utf16le("00:00:00", buf, (size_t)len);
     return TRUE;
 }
 
 BOOL GetDateFormatW(int loc, DWORD fmt, void* st, const wchar_t* pat,
                     wchar_t* buf, int len) {
     (void)loc; (void)fmt; (void)st; (void)pat;
-    if (buf && len > 0) wcscpy(buf, L"01/01/2025");
+    if (buf && len > 0) k32_utf8_to_utf16le("01/01/2025", buf, (size_t)len);
     return TRUE;
 }
 
@@ -1525,7 +1873,7 @@ void* LookupAccountSidWStub(void* a, void* b, void* c, DWORD* d, void* e, DWORD*
 }
 BOOL QueryFullProcessImageNameWStub(HANDLE a, DWORD b, wchar_t* c, DWORD* d) {
     (void)a; (void)b; (void)d;
-    if (c) wcscpy(c, L"cmd.exe");
+    if (c) k32_utf8_to_utf16le("cmd.exe", c, 260);
     return TRUE;
 }
 void SaferWorker(void* a, void* b, void* c, DWORD d, void* e) { (void)a; (void)b; (void)c; (void)d; (void)e; }
@@ -1599,9 +1947,17 @@ int WideCharToMultiByte(UINT cp, DWORD flags, const wchar_t* src, int srclen,
 }
 
 // lstrcmpW / lstrcmpiW
-int lstrcmpW(const wchar_t* a, const wchar_t* b) { return wcscmp(a, b); }
+int lstrcmpW(const wchar_t* a, const wchar_t* b) {
+    const uint16_t* ua = (const uint16_t*)a;
+    const uint16_t* ub = (const uint16_t*)b;
+    while (*ua && *ua == *ub) { ua++; ub++; }
+    return (int)*ua - (int)*ub;
+}
 int lstrcmpiW(const wchar_t* a, const wchar_t* b) {
-    return wcsncasecmp(a, b, SIZE_MAX);
+    const uint16_t* ua = (const uint16_t*)a;
+    const uint16_t* ub = (const uint16_t*)b;
+    while (*ua && towlower((wint_t)*ua) == towlower((wint_t)*ub)) { ua++; ub++; }
+    return (int)towlower((wint_t)*ua) - (int)towlower((wint_t)*ub);
 }
 
 // OpenSemaphoreW / WaitForSingleObjectEx
@@ -1640,8 +1996,11 @@ UINT SetThreadUILanguage(UINT lang) {
 #define REG_SZ 1
 #endif
 static void reg_unicode(const wchar_t* name, UNICODE_STRING* u) {
-    u->Length = (uint16_t)(wcslen(name) * sizeof(wchar_t));
-    u->MaximumLength = u->Length + sizeof(wchar_t);
+    const uint16_t* un = (const uint16_t*)name;
+    size_t len = 0;
+    while (un[len]) len++;
+    u->Length = (uint16_t)(len * sizeof(uint16_t));
+    u->MaximumLength = u->Length + sizeof(uint16_t);
     u->Buffer = (wchar_t*)name;
 }
 BOOL RegCloseKey(HKEY key) { (void)key; return TRUE; }

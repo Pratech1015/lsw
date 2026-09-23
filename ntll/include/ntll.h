@@ -42,9 +42,11 @@ typedef struct _ANSI_STRING {
 
 typedef struct _OBJECT_ATTRIBUTES {
     ULONG Length;
+    ULONG _pad1;
     HANDLE RootDirectory;
     PUNICODE_STRING ObjectName;
     ULONG Attributes;
+    ULONG _pad2;
     PVOID SecurityDescriptor;
     PVOID SecurityQualityOfService;
 } OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
@@ -397,6 +399,13 @@ int unix_to_nt_path(const char* unix_path, char* nt_path, int max_len);
 const char* nt_get_system_root(void);
 const char* nt_get_windows_dir(void);
 const char* nt_get_system32_dir(void);
+
+/* Global image path set by runtime.c before loading */
+extern char* g_image_path;
+
+/* UTF-16LE ↔ UTF-8 conversion (Windows wchar_t = 2 bytes) */
+int k32_utf16le_to_utf8(const void* wide, char* narrow, size_t max_out);
+int k32_utf8_to_utf16le(const char* narrow, void* wide, size_t max_out);
 
 /* Environment */
 char** nt_get_environment(void);
