@@ -1886,6 +1886,22 @@ static const struct FMT_SYSMSG g_sys_msgs[] = {
     { 206, "The filename or extension is too long." },
     { 267, "The directory name is invalid." },
     { 317, "The system cannot find message text for message number 0x%1 in the file %2." },
+    /* cmd.exe / console messages.  This distro's cmd.exe is repacked without
+     * an RT_MESSAGETABLE, so the module lookup fails for its own ids; list the
+     * texts the shell actually asks for (windows-11 build 22631). */
+    { 0x2328, "ATTENTION: The system was unable to load the previous saved copy of Help." },
+    { 0x2331, "'%2' is not recognized as an internal or external command,%noperable program or batch file." },
+    { 0x2339, " Volume Serial Number is %1" },
+    { 0x2350, "Microsoft Windows [Version 10.0.22631.4391]" },
+    { 0x235b, " Volume in drive %1 has no label." },
+    { 0x235c, " Volume Serial Number is %1" },
+    { 0x235e, " Directory of %1" },
+    { 0x235f, "The directory named %1 does not exist at the root." },
+    { 0x2362, " File Not Found." },
+    { 0x2373, "%1" },
+    { 0x2711, "%1 File(s) %2 bytes" },
+    { 0x2712, "%1 Dir(s) %2 bytes free" },
+    { 0x40002711, " File(s) bytes" },
 };
 
 static const char* k32_sys_msg(DWORD code) {
@@ -1990,6 +2006,10 @@ DWORD FormatMessageW(DWORD flags, void* src, DWORD msgid, DWORD lang,
 
     if (!text && !fixed[0]) {
         /* Message not found anywhere. Windows fails with ERROR_MR_MID_NOT_FOUND. */
+        {
+            const char* e = getenv("LSW_TRACE_ALL");
+            if (e && *e) fprintf(stderr, "[fmiss] flags=0x%x id=0x%lx src=%p\n", flags, (unsigned long)msgid, src);
+        }
         win32_set_last_error(ERROR_MR_MID_NOT_FOUND);
         if (flags & FMT_ALLOCATE_BUFFER) {
             if (buf) *(void**)buf = NULL;
@@ -1999,11 +2019,11 @@ DWORD FormatMessageW(DWORD flags, void* src, DWORD msgid, DWORD lang,
 
     /* Insert args: `args` points to the first vararg slot. With
      * FORMAT_MESSAGE_ARGUMENT_ARRAY the caller passes the array itself in
-     * `args`. Windows does NOT consume a vararg for ALLOCATE_BUFFER; the
-     * allocation destination is `*buf` (the parameter doubles as a
-     * pointer-to-pointer there). */
+     * `args`; otherwise `args` is a va_list, which on the guest x64 is the
+     * pointer to the caller's variable argument block. Windows does NOT
+     * consume a vararg for ALLOCATE_BUFFER; the allocation destination is
+     * `*buf` (the parameter doubles as a pointer-to-pointer there). */
     uintptr_t* argp = (uintptr_t*)args;
-    int arg_idx = 0;
 
     /* Compose the message string (UTF-8). */
     char out8[8192];
@@ -2015,11 +2035,11 @@ DWORD FormatMessageW(DWORD flags, void* src, DWORD msgid, DWORD lang,
 
     const char* p = text ? text8 : fixed;
     while (*p && op < sizeof(out8) - 256) {
-        if (*p == '%' && !(flags & FMT_IGNORE_INSERTS) && p[1]) {
+        if (*p == '%' && p[1]) {
             if (p[1] == '%') { k32_append_utf8(out8, &op, sizeof(out8), "%"); p += 2; continue; }
+            if (p[1] == 'n') { k32_append_utf8(out8, &op, sizeof(out8), "\n"); p += 2; continue; }
             if (p[1] >= '1' && p[1] <= '9') {
                 unsigned argn = (unsigned)(p[1] - '0');
-                (void)argn;
                 p += 2;
                 char tag[16] = {0};
                 if (*p == '!') {
@@ -2033,7 +2053,7 @@ DWORD FormatMessageW(DWORD flags, void* src, DWORD msgid, DWORD lang,
                     tag[0] = *p; tag[1] = 0; p++;
                 }
                 uintptr_t av = 0;
-                if (argp) av = argp[arg_idx++];
+                if (argp && argn <= 9 && argn - 1 < 64) av = argp[argn - 1];
                 char vb[96] = {0};
                 if (strchr(tag, 'c')) {
                     k32_append_wchar_utf8(out8, &op, sizeof(out8), (uint16_t)(av & 0xFFFF));
