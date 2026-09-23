@@ -103,6 +103,8 @@ if [[ -x "$RUNTIME" ]]; then
     out="$(printf 'echo hello world\necho testing 123\nexit\n' | timeout 10 "$RUNTIME" "${ROOTFS_DIR}/drive_c/Windows/System32/cmd.exe" 2>/dev/null || true)"
     assert_contains "echo outputs text" "hello world" "$out"
     assert_contains "echo works for second command" "testing 123" "$out"
+    out="$(printf 'dir\nexit\n' | timeout 20 "$RUNTIME" "${ROOTFS_DIR}/drive_c/Windows/System32/cmd.exe" 2>/dev/null || true)"
+    assert_contains "dir lists C:\ root" "Windows" "$out"
 else
     todo "builtin cmd.exe test"
 fi

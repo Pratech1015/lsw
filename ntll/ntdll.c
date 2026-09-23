@@ -278,8 +278,7 @@ NTSTATUS RtlRegisterFeatureConfigurationChangeNotification(
 
 NTSTATUS RtlQueryFeatureConfiguration(
     ULONG sub_group_count, void* sub_group, ULONG feature_count, void* features, ULONG* return_count) {
-    (void)sub_group_count; (void)sub_group; (void)feature_count; (void)features;
-    if (return_count) *return_count = 0;
+    (void)sub_group_count; (void)sub_group; (void)feature_count; (void)features; (void)return_count;
     return 0;
 }
 

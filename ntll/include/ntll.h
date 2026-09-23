@@ -451,6 +451,7 @@ void ntll_log(int level, const char* format, ...);
 /* Module loading / dispatch (implemented in dispatch.c) */
 void* ntll_dispatch(PNTLL_MODULE module, const char* name);
 PNTLL_MODULE ntll_load_system_module(const char* dll_name);
+PNTLL_MODULE ntll_get_main_module(void);
 int ntll_heap_alloc_extern(size_t size);
 void* ntll_heap_alloc(size_t size);
 void ntll_heap_free(void* ptr);

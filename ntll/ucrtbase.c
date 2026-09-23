@@ -747,15 +747,27 @@ void _CxxThrowException(void* obj, void* t) {
     (void)obj; (void)t;
 }
 
-void _local_unwind(void* f, void* d) {
-    /* Minimal SEH unwind stub.  On Windows x64, _local_unwind walks the
-     * frame chain from the current frame to the target frame 'f', calling
-     * __finally blocks along the way.  Since we don't have pdata/xdata
-     * unwind info on Linux, just return and let the normal C unwinding
-     * handle cleanup.  Returning without doing anything is safe here
-     * because the PE code's __finally blocks are implemented as normal
-     * function calls in the MSVC codegen. */
-    (void)f; (void)d;
+void _local_unwind(void* frame, void* target) {
+    /* Windows: _local_unwind(frame, target) = RtlUnwind(frame, target,
+     * NULL, 0).  It NEVER returns to the call site: it unwinds the stack
+     * to `frame` and transfers control to `target` (an error-exit label
+     * in the same function, which sets eax and runs the epilogue).
+     *
+     * The trampoline converts the MS ABI args (rcx, rdx) to SysV
+     * (rdi, rsi) before tail-calling us, so `frame` is in rdi and
+     * `target` in rsi.  `frame` equals the caller function's
+     * post-prologue rsp (cmd stores it at [rsp+0x28] at function entry),
+     * which is exactly the rsp the target code expects (its epilogue
+     * does lea 0x280(%rsp),%r11 / pops / ret).
+     *
+     * We don't run __finally bodies (no pdata/xdata unwind info on
+     * Linux); call sites invoke object destructors manually beforehand,
+     * so the only cost is an occasional skipped free() on error paths. */
+    __asm__ __volatile__(
+        "movq %0, %%rsp\n\t"
+        "jmp *%1"
+        : : "r"(frame), "r"(target) : "memory");
+    __builtin_unreachable();
 }
 
 /* ms_abi implementations of __intrinsic_setjmp/longjmp that bypass
@@ -866,6 +878,7 @@ size_t lsw_utf16_wcslen(const unsigned short* s) {
 }
 
 unsigned short* lsw_utf16_wcschr(const unsigned short* s, unsigned short c) {
+    if (!s) return NULL;
     while (*s) { if (*s == c) return (unsigned short*)s; s++; }
     return c == 0 ? (unsigned short*)s : NULL;
 }

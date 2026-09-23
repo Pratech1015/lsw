@@ -56,6 +56,7 @@ DWORD win32_get_current_directory(DWORD,char*);
 BOOL SetCurrentDirectoryW_impl(const wchar_t*);
 DWORD GetCurrentDirectoryW(DWORD,wchar_t*);
 DWORD GetEnvironmentVariableW(const wchar_t*,wchar_t*,DWORD);
+BOOL SetEnvironmentVariableW(const wchar_t*,const wchar_t*);
 BOOL win32_alloc_console(void); BOOL win32_free_console(void);
 BOOL win32_set_console_title(const char*);
 DWORD win32_get_console_title(char*,DWORD);
@@ -407,7 +408,7 @@ static const API_ENTRY g_api_table[] = {
     {"kernel32.dll","SetCurrentDirectoryA",(void*)win32_set_current_directory},
     {"kernel32.dll","SetCurrentDirectoryW",(void*)SetCurrentDirectoryW_impl},
     {"kernel32.dll","GetCurrentDirectoryA",(void*)win32_get_current_directory},
-    {"kernel32.dll","GetCurrentDirectoryW",(void*)win32_get_current_directory},
+    {"kernel32.dll","GetCurrentDirectoryW",(void*)GetCurrentDirectoryW},
     {"kernel32.dll","AllocConsole",(void*)win32_alloc_console},
     {"kernel32.dll","FreeConsole",(void*)win32_free_console},
     {"kernel32.dll","SetConsoleTitleA",(void*)win32_set_console_title},
@@ -480,7 +481,7 @@ static const API_ENTRY g_api_table[] = {
     {"kernel32.dll","GetEnvironmentVariableA",(void*)win32_get_environment_variable},
     {"kernel32.dll","GetEnvironmentVariableW",(void*)GetEnvironmentVariableW},
     {"kernel32.dll","SetEnvironmentVariableA",(void*)win32_set_environment_variable},
-    {"kernel32.dll","SetEnvironmentVariableW",(void*)win32_set_environment_variable},
+    {"kernel32.dll","SetEnvironmentVariableW",(void*)SetEnvironmentVariableW},
     {"kernel32.dll","GetModuleHandleA",(void*)win32_get_module_handle},
     {"kernel32.dll","GetModuleHandleW",(void*)win32_get_module_handle},
     {"kernel32.dll","GetModuleHandleExA",(void*)win32_get_module_handle},

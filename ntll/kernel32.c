@@ -20,6 +20,7 @@
 #include <sys/wait.h>
 #include <wctype.h>
 
+#include <stdarg.h>
 #include "ntll.h"
 
 extern wchar_t g_cmdline[4096];
@@ -29,6 +30,7 @@ char* g_image_path = NULL;
 #define WINDOWS_TICK ((uint64_t)10000000)
 #define SEC_TO_UNIX_EPOCH ((uint64_t)11644473600LL)
 #define ERROR_FILE_NOT_FOUND 0x02
+#define ERROR_INVALID_HANDLE 0x6
 #define FILE_ATTRIBUTE_READONLY  0x0001
 #define FILE_ATTRIBUTE_HIDDEN    0x0002
 #define FILE_ATTRIBUTE_DIRECTORY 0x0010
@@ -271,7 +273,16 @@ int unix_to_nt_path(const char* unix, char* nt, int max_len) {
         rel = unix + strlen(system_root);
         while (*rel == '/') rel++;
     }
-    snprintf(nt, max_len, "C:\\%s", rel);
+    char drive = 'C';
+    if (strncmp(rel, "drive_", 6) == 0 &&
+        ((rel[6] >= 'a' && rel[6] <= 'z') || (rel[6] >= 'A' && rel[6] <= 'Z')) &&
+        (rel[7] == '/' || rel[7] == '\0')) {
+        drive = rel[6];
+        if (drive >= 'a' && drive <= 'z') drive = (char)(drive - 'a' + 'A');
+        rel += 7;
+        while (*rel == '/') rel++;
+    }
+    snprintf(nt, max_len, "%c:\\%s", drive, rel);
     for (char* p = nt; *p; p++) { if (*p == '/') *p = '\\'; }
     return 0;
 }
@@ -596,9 +607,18 @@ BOOL win32_get_console_mode(HANDLE c, DWORD* mode) {
 BOOL win32_get_console_screen_buffer_info(HANDLE c, void* info) {
     (void)c;
     if (info) {
-        memset(info, 0, 22);
-        ((short*)info)[4] = 80;
-        ((short*)info)[5] = 25;
+        /* CONSOLE_SCREEN_BUFFER_INFO (22 bytes):
+         *  0 COORD  dwSize            {X,Y}
+         *  4 COORD  dwCursorPosition  {X,Y}
+         *  8 WORD   wAttributes
+         * 10 SMALL_RECT srWindow      {L,T,R,B}
+         * 18 COORD  dwMaximumWindowSize {X,Y} */
+        short* s = (short*)info;
+        s[0] = 80;  s[1] = 25;            /* dwSize */
+        s[2] = 0;   s[3] = 0;             /* cursor */
+        ((unsigned short*)info)[4] = 7;   /* wAttributes */
+        s[5] = 0;   s[6] = 0;  s[7] = 79; s[8] = 24;   /* srWindow */
+        s[9] = 80;  s[10] = 25;           /* max window size */
     }
     return TRUE;
 }
@@ -823,6 +843,9 @@ void win32_get_system_info(void* info) {
     ((WORD*)info)[24] = 0;
 }
 
+int unix_to_nt_path(const char*, char*, int);
+static const char* k32_hidden_var_get(const char*);
+
 DWORD win32_get_environment_variable(const char* name, char* buf, DWORD size) {
     const char* val = getenv(name);
     if (!val) { win32_set_last_error(203); return 0; }
@@ -845,7 +868,9 @@ DWORD GetEnvironmentVariableW(const wchar_t* wname, wchar_t* buf, DWORD size) {
     const char* val = NULL;
     char override[1024] = {0};
 
-    if (strcasecmp(name, "PATH") == 0) {
+    if (name[0] == '=') {
+        val = k32_hidden_var_get(name);
+    } else if (strcasecmp(name, "PATH") == 0) {
         snprintf(override, sizeof(override),
                  "%s/drive_c/Windows/System32;%s/drive_c/Windows;"
                  "%s/drive_c/Windows/System32/WindowsPowerShell/v1.0;"
@@ -888,7 +913,52 @@ DWORD GetEnvironmentVariableW(const wchar_t* wname, wchar_t* buf, DWORD size) {
 }
 
 BOOL win32_set_environment_variable(const char* name, const char* value) {
+    if (!name || name[0] == '\0' || strchr(name, '=')) {
+        win32_set_last_error(87);
+        return FALSE;
+    }
     return setenv(name, value ? value : "", 1) == 0;
+}
+
+/* Windows "hidden" env vars (=C:, =D:, ...) track the per-drive current
+ * directory.  They are not part of the POSIX environ (glibc rejects name
+ * components containing '='), so keep them in a side table. */
+static char g_hidden_names[16][64];
+static char g_hidden_values[16][512];
+static int g_hidden_count = 0;
+
+static const char* k32_hidden_var_get(const char* name) {
+    for (int i = 0; i < g_hidden_count; i++)
+        if (strcmp(g_hidden_names[i], name) == 0) return g_hidden_values[i];
+    return NULL;
+}
+
+static void k32_hidden_var_set(const char* name, const char* value) {
+    for (int i = 0; i < g_hidden_count; i++) {
+        if (strcmp(g_hidden_names[i], name) == 0) {
+            snprintf(g_hidden_values[i], sizeof(g_hidden_values[i]), "%s", value ? value : "");
+            return;
+        }
+    }
+    if (g_hidden_count < 16) {
+        snprintf(g_hidden_names[g_hidden_count], sizeof(g_hidden_names[g_hidden_count]), "%s", name);
+        snprintf(g_hidden_values[g_hidden_count], sizeof(g_hidden_values[g_hidden_count]), "%s", value ? value : "");
+        g_hidden_count++;
+    }
+}
+
+BOOL SetEnvironmentVariableW(const wchar_t* wname, const wchar_t* wvalue) {
+    if (!wname) { win32_set_last_error(87); return FALSE; }
+    char name[256];
+    k32_utf16le_to_utf8(wname, name, sizeof(name));
+    char value[2048];
+    if (wvalue) k32_utf16le_to_utf8(wvalue, value, sizeof(value));
+    else value[0] = 0;
+    if (name[0] == '=') {
+        k32_hidden_var_set(name, value);
+        return TRUE;
+    }
+    return win32_set_environment_variable(name, value);
 }
 
 DWORD win32_get_command_line(void) {
@@ -1319,6 +1389,7 @@ BOOL SetConsoleCtrlHandler(void* handler, BOOL add) {
 // ── File: Find* ────────────────────────────────────────────────
 
 typedef struct { DIR* d; char pattern[512]; char base[1024]; int first; } FIND_CTX;
+static FIND_CTX g_find[64];
 
 HANDLE FindFirstFileW(const wchar_t* wpattern, void* data) {
     if (!wpattern || !data) return INVALID_HANDLE_VALUE;
@@ -1335,15 +1406,29 @@ HANDLE FindFirstFileW(const wchar_t* wpattern, void* data) {
         if (dlen == 0) dlen = 1;
         memcpy(dirpath, upath, dlen);
         dirpath[dlen] = '\0';
+        if (dlen > 0 && dirpath[dlen - 1] == ':') {
+            dirpath[dlen] = '/';
+            dirpath[dlen + 1] = '\0';
+        }
         snprintf(match, sizeof(match), "%s", sl + 1);
     }
-    DIR* d = opendir(dirpath);
-    if (!d) return INVALID_HANDLE_VALUE;
-    FIND_CTX* ctx = (FIND_CTX*)data;
+    FIND_CTX* ctx = NULL;
+    for (int i = 0; i < 64; i++) { if (!g_find[i].d) { ctx = &g_find[i]; break; } }
+    if (!ctx) return INVALID_HANDLE_VALUE;
+    DIR* d = NULL;
+    {
+        char unixdir[4096];
+        if (nt_to_unix_path(dirpath, unixdir, sizeof(unixdir)) != 0) {
+            win32_set_last_error(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+        d = opendir(unixdir);
+        if (d) snprintf(ctx->base, sizeof(ctx->base), "%s", unixdir);
+    }
+    if (!d) { win32_set_last_error(ERROR_FILE_NOT_FOUND); return INVALID_HANDLE_VALUE; }
     ctx->d = d;
     ctx->first = 1;
     snprintf(ctx->pattern, sizeof(ctx->pattern), "%s", match);
-    snprintf(ctx->base, sizeof(ctx->base), "%s", dirpath);
     /* find first match */
     struct dirent* e;
     while ((e = readdir(d)) != NULL) {
@@ -1353,9 +1438,9 @@ HANDLE FindFirstFileW(const wchar_t* wpattern, void* data) {
             k32_utf8_to_utf16le(e->d_name, wname, 260);
             /* fill file attributes */
             DWORD* attrs = (DWORD*)((char*)data);
-            struct stat st;
+            struct stat st = {0};
             char fullpath[4096];
-            snprintf(fullpath, sizeof(fullpath), "%s/%s", dirpath, e->d_name);
+            snprintf(fullpath, sizeof(fullpath), "%s/%s", ctx->base, e->d_name);
             *attrs = 0x80;
             if (stat(fullpath, &st) == 0) {
                 if (S_ISDIR(st.st_mode)) *attrs = FILE_ATTRIBUTE_DIRECTORY;
@@ -1363,17 +1448,18 @@ HANDLE FindFirstFileW(const wchar_t* wpattern, void* data) {
             /* fill file size */
             uint64_t* fsize = (uint64_t*)((char*)data + 32);
             *fsize = (S_ISREG(st.st_mode)) ? (uint64_t)st.st_size : 0;
-            return (HANDLE)(uintptr_t)1;
+            return (HANDLE)(uintptr_t)(ctx - g_find + 1);
         }
     }
     closedir(d);
+    ctx->d = NULL;
     return INVALID_HANDLE_VALUE;
 }
 
 BOOL FindNextFileW(HANDLE h, void* data) {
-    (void)h;
-    FIND_CTX* ctx = (FIND_CTX*)data;
-    if (!ctx || !ctx->d) return FALSE;
+    long idx = (long)(uintptr_t)h - 1;
+    if (idx < 0 || idx >= 64 || !g_find[idx].d) { win32_set_last_error(ERROR_INVALID_HANDLE); return FALSE; }
+    FIND_CTX* ctx = &g_find[idx];
     struct dirent* e;
     while ((e = readdir(ctx->d)) != NULL) {
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
@@ -1381,7 +1467,7 @@ BOOL FindNextFileW(HANDLE h, void* data) {
             uint16_t* wname = (uint16_t*)((char*)data + 44);
             k32_utf8_to_utf16le(e->d_name, wname, 260);
             DWORD* attrs = (DWORD*)((char*)data);
-            struct stat st;
+            struct stat st = {0};
             char fullpath[4096];
             snprintf(fullpath, sizeof(fullpath), "%s/%s", ctx->base, e->d_name);
             *attrs = 0x80;
@@ -1398,7 +1484,14 @@ BOOL FindNextFileW(HANDLE h, void* data) {
     return FALSE;
 }
 
-BOOL FindClose(HANDLE h) { (void)h; return TRUE; }
+BOOL FindClose(HANDLE h) {
+    long idx = (long)(uintptr_t)h - 1;
+    if (idx >= 0 && idx < 64 && g_find[idx].d) {
+        closedir(g_find[idx].d);
+        g_find[idx].d = NULL;
+    }
+    return TRUE;
+}
 HANDLE FindFirstFileExW(const wchar_t* a, int b, void* c) { (void)b; return FindFirstFileW(a, c); }
 BOOL FindFirstStreamWStub(const wchar_t* a, int b, void* c, DWORD d) {
     (void)a; (void)b; (void)c; (void)d; return FALSE;
@@ -1529,8 +1622,11 @@ DWORD SearchPathW(const wchar_t* dir, const wchar_t* file, const wchar_t* ext,
 BOOL GetVolumeInformationW(const wchar_t* root, wchar_t* label, DWORD lsz,
                            DWORD* serial, DWORD* maxcomp, DWORD* flags,
                            wchar_t* fsname, DWORD fsnsz) {
-    (void)root; (void)serial; (void)maxcomp; (void)flags;
+    (void)root;
     if (label && lsz > 0) label[0] = 0;
+    if (serial) *serial = 0x12340001;
+    if (maxcomp) *maxcomp = 255;
+    if (flags) *flags = 0x0000801F;  /* unicode, case-preserved, persistent ACLs, ... */
     if (fsname && fsnsz > 0) k32_utf8_to_utf16le("NTFS", fsname, (size_t)fsnsz);
     return TRUE;
 }
@@ -1760,10 +1856,224 @@ wchar_t* GetCommandLineW(void) {
 
 // ── FormatMessageW ─────────────────────────────────────────────
 
+#define FMT_ALLOCATE_BUFFER  0x00000100
+#define FMT_IGNORE_INSERTS   0x00000200
+#define FMT_FROM_HMODULE     0x00000800
+#define FMT_FROM_SYSTEM      0x00001000
+#define FMT_ARGUMENT_ARRAY   0x00002000
+#define ERROR_INSUFFICIENT_BUFFER 0x7A
+#define ERROR_MR_MID_NOT_FOUND    0xCE0
+
+typedef struct { DWORD Characteristics, TimeDateStamp;
+                 WORD MajorVersion, MinorVersion;
+                 WORD NumberOfNamedEntries, NumberOfIdEntries; } IMG_RES_DIR;
+typedef struct { DWORD Name, OffsetToData; } IMG_RES_ENTRY;
+typedef struct { DWORD OffsetToData, Size, CodePage, Reserved; } IMG_RES_DATA;
+typedef struct { DWORD LowId, HighId, OffsetToEntries; } MSG_BLOCK;
+typedef struct { WORD Length, Flags; uint16_t Text[1]; } MSG_ENTRY;
+typedef struct { DWORD NumberOfBlocks; MSG_BLOCK Blocks[1]; } MSG_DATA;
+
+struct FMT_SYSMSG { DWORD code; const char* text; };
+static const struct FMT_SYSMSG g_sys_msgs[] = {
+    { 2, "The system cannot find the file specified." },
+    { 3, "The system cannot find the path specified." },
+    { 5, "Access is denied." },
+    { 6, "The handle is invalid." },
+    { 8, "Not enough storage is available to process this command." },
+    { 50, "The request is not supported." },
+    { 87, "The parameter is incorrect." },
+    { 123, "The filename, directory name, or volume label syntax is incorrect." },
+    { 206, "The filename or extension is too long." },
+    { 267, "The directory name is invalid." },
+    { 317, "The system cannot find message text for message number 0x%1 in the file %2." },
+};
+
+static const char* k32_sys_msg(DWORD code) {
+    for (size_t i = 0; i < sizeof(g_sys_msgs) / sizeof(g_sys_msgs[0]); i++)
+        if (g_sys_msgs[i].code == code) return g_sys_msgs[i].text;
+    return NULL;
+}
+
+/* Locate msgid in the module's RT_MESSAGETABLE; returns UTF-16 text + char count. */
+static const uint16_t* k32_lookup_message_text(PNTLL_MODULE mod, DWORD msgid, DWORD* out_chars) {
+    if (out_chars) *out_chars = 0;
+    if (!mod || !mod->nt_headers) return NULL;
+    IMAGE_DATA_DIRECTORY* dd =
+        &mod->nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE];
+    if (!dd->VirtualAddress || !dd->Size) return NULL;
+    const BYTE* base = (BYTE*)mod->base_address;
+    const IMG_RES_DIR* root = (const IMG_RES_DIR*)(base + dd->VirtualAddress);
+    const IMG_RES_ENTRY* e0 = (const IMG_RES_ENTRY*)(root + 1);
+    for (DWORD i = 0; i < (DWORD)root->NumberOfNamedEntries + root->NumberOfIdEntries; i++) {
+        if (e0[i].Name != 11) continue;  /* RT_MESSAGETABLE */
+        if (!(e0[i].OffsetToData & 0x80000000)) continue;
+        const IMG_RES_DIR* types =
+            (const IMG_RES_DIR*)(base + dd->VirtualAddress + (e0[i].OffsetToData & 0x7FFFFFFF));
+        const IMG_RES_ENTRY* e1 = (const IMG_RES_ENTRY*)(types + 1);
+        for (DWORD j = 0; j < (DWORD)types->NumberOfNamedEntries + types->NumberOfIdEntries; j++) {
+            if (e1[j].OffsetToData & 0x80000000) continue;
+            const IMG_RES_DATA* de =
+                (const IMG_RES_DATA*)(base + dd->VirtualAddress + e1[j].OffsetToData);
+            if (!de->OffsetToData || de->Size < sizeof(DWORD)) continue;
+            const MSG_DATA* md = (const MSG_DATA*)(base + de->OffsetToData);
+            if (!md->NumberOfBlocks) continue;
+            for (DWORD b = 0; b < md->NumberOfBlocks; b++) {
+                if (msgid < md->Blocks[b].LowId) break;
+                if (msgid > md->Blocks[b].HighId) continue;
+                DWORD idx = msgid - md->Blocks[b].LowId;
+                const MSG_ENTRY* entry =
+                    (const MSG_ENTRY*)((BYTE*)md + md->Blocks[b].OffsetToEntries);
+                for (DWORD k = 0; ; k++) {
+                    if ((DWORD)entry->Length < 4) return NULL;
+                    if (k == idx) {
+                        DWORD chars = ((DWORD)entry->Length - 4) / 2;
+                        if (chars && entry->Text[chars - 1] == 0) chars--;
+                        if (out_chars) *out_chars = chars;
+                        return (const uint16_t*)entry->Text;
+                    }
+                    entry = (const MSG_ENTRY*)((BYTE*)entry + entry->Length);
+                }
+            }
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static void k32_append_utf8(char* out, size_t* used, size_t cap, const char* s) {
+    size_t n = strlen(s);
+    if (n > cap - *used - 1) n = cap - *used - 1;
+    memcpy(out + *used, s, n);
+    *used += n;
+    out[*used] = 0;
+}
+
+static void k32_append_wchar_utf8(char* out, size_t* used, size_t cap, uint16_t ch) {
+    char tmp[4] = {0};
+    int n = 1;
+    if (ch < 0x80) {
+        tmp[0] = (char)ch;
+    } else if (ch < 0x800) {
+        tmp[0] = (char)(0xC0 | (ch >> 6));
+        tmp[1] = (char)(0x80 | (ch & 0x3F));
+        n = 2;
+    } else {
+        tmp[0] = (char)(0xE0 | (ch >> 12));
+        tmp[1] = (char)(0x80 | ((ch >> 6) & 0x3F));
+        tmp[2] = (char)(0x80 | (ch & 0x3F));
+        n = 3;
+    }
+    if (n < 4) tmp[n] = 0;
+    k32_append_utf8(out, used, cap, tmp);
+}
+
 DWORD FormatMessageW(DWORD flags, void* src, DWORD msgid, DWORD lang,
                      wchar_t* buf, DWORD len, void* args) {
-    (void)flags; (void)src; (void)msgid; (void)lang; (void)args;
-    if (buf && len > 0) buf[0] = L'\0';
+    (void)lang;
+    const uint16_t* text = NULL;
+    char fixed[1024] = {0};
+
+    if (flags & FMT_FROM_SYSTEM) {
+        const char* s = k32_sys_msg(msgid);
+        if (s) {
+            snprintf(fixed, sizeof(fixed), "%s", s);
+        } else {
+            PNTLL_MODULE mod = (PNTLL_MODULE)(uintptr_t)ntll_get_main_module();
+            text = k32_lookup_message_text(mod, msgid, NULL);
+            if (!text) text = k32_lookup_message_text((PNTLL_MODULE)src, msgid, NULL);
+        }
+    } else if (flags & FMT_FROM_HMODULE) {
+        PNTLL_MODULE mod = (PNTLL_MODULE)src;
+        if (!mod) mod = (PNTLL_MODULE)(uintptr_t)ntll_get_main_module();
+        text = k32_lookup_message_text(mod, msgid, NULL);
+    }
+
+    if (!text && !fixed[0]) {
+        /* Message not found anywhere. Windows fails with ERROR_MR_MID_NOT_FOUND. */
+        win32_set_last_error(ERROR_MR_MID_NOT_FOUND);
+        if (flags & FMT_ALLOCATE_BUFFER) {
+            if (buf) *(void**)buf = NULL;
+        }
+        return 0;
+    }
+
+    /* Insert args: `args` points to the first vararg slot. With
+     * FORMAT_MESSAGE_ARGUMENT_ARRAY the caller passes the array itself in
+     * `args`. Windows does NOT consume a vararg for ALLOCATE_BUFFER; the
+     * allocation destination is `*buf` (the parameter doubles as a
+     * pointer-to-pointer there). */
+    uintptr_t* argp = (uintptr_t*)args;
+    int arg_idx = 0;
+
+    /* Compose the message string (UTF-8). */
+    char out8[8192];
+    size_t op = 0;
+    out8[0] = 0;
+
+    char text8[4096] = {0};
+    if (text) k32_utf16le_to_utf8(text, text8, sizeof(text8));
+
+    const char* p = text ? text8 : fixed;
+    while (*p && op < sizeof(out8) - 256) {
+        if (*p == '%' && !(flags & FMT_IGNORE_INSERTS) && p[1]) {
+            if (p[1] == '%') { k32_append_utf8(out8, &op, sizeof(out8), "%"); p += 2; continue; }
+            if (p[1] >= '1' && p[1] <= '9') {
+                unsigned argn = (unsigned)(p[1] - '0');
+                (void)argn;
+                p += 2;
+                char tag[16] = {0};
+                if (*p == '!') {
+                    const char* q = ++p;
+                    while (*q && *q != '!' && (size_t)(q - p) < 15) q++;
+                    size_t tl = (size_t)(q - p);
+                    memcpy(tag, p, tl); tag[tl] = 0;
+                    p = q;
+                    if (*p) p++;
+                } else if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')) {
+                    tag[0] = *p; tag[1] = 0; p++;
+                }
+                uintptr_t av = 0;
+                if (argp) av = argp[arg_idx++];
+                char vb[96] = {0};
+                if (strchr(tag, 'c')) {
+                    k32_append_wchar_utf8(out8, &op, sizeof(out8), (uint16_t)(av & 0xFFFF));
+                } else if (strchr(tag, 'd') || strchr(tag, 'u') || strchr(tag, 'i')) {
+                    snprintf(vb, sizeof(vb), "%ld", (long)(int32_t)(uint32_t)av);
+                    k32_append_utf8(out8, &op, sizeof(out8), vb);
+                } else if (strchr(tag, 'x') || strchr(tag, 'X')) {
+                    snprintf(vb, sizeof(vb), strchr(tag, 'X') ? "%lX" : "%lx",
+                             (unsigned long)(uint32_t)av);
+                    k32_append_utf8(out8, &op, sizeof(out8), vb);
+                } else {
+                    const uint16_t* ws = (const uint16_t*)(uintptr_t)av;
+                    char ub[512] = {0};
+                    if (ws) k32_utf16le_to_utf8(ws, ub, sizeof(ub));
+                    k32_append_utf8(out8, &op, sizeof(out8), ub);
+                }
+                continue;
+            }
+        }
+        out8[op++] = *p++;
+        out8[op] = 0;
+    }
+    if (!(flags & 1)) k32_append_utf8(out8, &op, sizeof(out8), "\r\n");
+    out8[op] = 0;
+
+    DWORD need = (DWORD)strlen(out8);
+    wchar_t* target = buf;
+    DWORD cap = len;
+    if (flags & FMT_ALLOCATE_BUFFER) {
+        size_t bytes = (size_t)(need + 8) * sizeof(uint16_t) + sizeof(uint16_t);
+        void* heap = calloc(1, bytes);
+        if (buf) *(void**)buf = heap;
+        target = (wchar_t*)heap;
+        cap = need + 8;
+    }
+    if (target && cap > need) {
+        k32_utf8_to_utf16le(out8, (uint16_t*)target, cap);
+        return need;
+    }
+    win32_set_last_error(ERROR_INSUFFICIENT_BUFFER);
     return 0;
 }
 

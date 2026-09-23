@@ -16,6 +16,8 @@
 
 static PNTLL_MODULE g_main_module = NULL;
 
+PNTLL_MODULE ntll_get_main_module(void) { return g_main_module; }
+
 /* fake Windows TEB/PEB so PE code can access gs-relative structures */
 static void* g_teb = NULL;
 static void* g_peb = NULL;
