@@ -331,7 +331,7 @@ int main(int argc, char* argv[]) {
         const char* rootfs = getenv("LSW_ROOTFS");
         static char cmd_path[4096];
         if (rootfs) {
-            snprintf(cmd_path, sizeof(cmd_path), "%s/Windows/System32/cmd.exe", rootfs);
+            snprintf(cmd_path, sizeof(cmd_path), "%s/drive_c/Windows/System32/cmd.exe", rootfs);
             if (access(cmd_path, R_OK) == 0) program = cmd_path;
         }
     }
