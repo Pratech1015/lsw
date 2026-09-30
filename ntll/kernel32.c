@@ -37,7 +37,6 @@ char* g_image_path = NULL;
 #define FILE_ATTRIBUTE_NORMAL    0x0080
 
 static DWORD g_last_error = 0;
-static pthread_mutex_t g_error_lock = PTHREAD_MUTEX_INITIALIZER;
 
 DWORD win32_get_last_error(void) { return g_last_error; }
 void win32_set_last_error(DWORD error) { g_last_error = error; }
@@ -1431,6 +1430,12 @@ BOOL SetConsoleCtrlHandler(void* handler, BOOL add) {
 typedef struct { DIR* d; char pattern[512]; char base[1024]; int first; } FIND_CTX;
 static FIND_CTX g_find[64];
 
+static void k32_unix_to_filetime(time_t t, uint32_t* out) {
+    uint64_t ft = ((uint64_t)(t + 11644473600LL)) * 10000000ULL;
+    out[0] = (uint32_t)ft;
+    out[1] = (uint32_t)(ft >> 32);
+}
+
 HANDLE FindFirstFileW(const wchar_t* wpattern, void* data) {
     if (!wpattern || !data) return INVALID_HANDLE_VALUE;
     char upath[2048];
@@ -1488,6 +1493,10 @@ HANDLE FindFirstFileW(const wchar_t* wpattern, void* data) {
             /* fill file size */
             uint64_t* fsize = (uint64_t*)((char*)data + 32);
             *fsize = (S_ISREG(st.st_mode)) ? (uint64_t)st.st_size : 0;
+            /* fill file times */
+            k32_unix_to_filetime(st.st_ctime, (uint32_t*)((char*)data + 4));
+            k32_unix_to_filetime(st.st_atime, (uint32_t*)((char*)data + 12));
+            k32_unix_to_filetime(st.st_mtime, (uint32_t*)((char*)data + 20));
             return (HANDLE)(uintptr_t)(ctx - g_find + 1);
         }
     }
@@ -1516,6 +1525,9 @@ BOOL FindNextFileW(HANDLE h, void* data) {
             }
             uint64_t* fsize = (uint64_t*)((char*)data + 32);
             *fsize = (S_ISREG(st.st_mode)) ? (uint64_t)st.st_size : 0;
+            k32_unix_to_filetime(st.st_ctime, (uint32_t*)((char*)data + 4));
+            k32_unix_to_filetime(st.st_atime, (uint32_t*)((char*)data + 12));
+            k32_unix_to_filetime(st.st_mtime, (uint32_t*)((char*)data + 20));
             return TRUE;
         }
     }
@@ -2045,6 +2057,58 @@ static void k32_append_wchar_utf8(char* out, size_t* used, size_t cap, uint16_t 
     k32_append_utf8(out, used, cap, tmp);
 }
 
+/* Crash-safe read of guest memory via /proc/self/mem.  Returns 0 on success. */
+static int k32_safe_read(uintptr_t addr, void* dst, size_t len) {
+    static int memfd = -1;
+    if (memfd < 0) { memfd = open("/proc/self/mem", O_RDONLY); if (memfd < 0) return -1; }
+    return pread(memfd, dst, len, (off_t)addr) == (ssize_t)len ? 0 : -1;
+}
+
+/* Decode an insert string that may be UTF-16LE or UTF-32LE (cmd in this distro
+ * is built with 4-byte wchar_t), writing UTF-8 into out.  Returns a score equal
+ * to the number of leading ASCII-printable chars so the caller can pick the
+ * most plausible interpretation, or -1 when the address is unreadable. */
+static int k32_decode_insert(uintptr_t addr, char* out, size_t osz) {
+    unsigned char raw[256];
+    char cand[512] = {0};
+    int best_score = -1;
+    if (osz < 2) return -1;
+    if (k32_safe_read(addr, raw, sizeof(raw)) != 0) return -1;
+    for (int width = 2; width <= 4; width += 2) {
+        char tmp[512] = {0};
+        size_t op = 0;
+        int score = 0;
+        for (size_t i = 0; i < sizeof(raw) / (size_t)width; i++) {
+            uint32_t u;
+            if (width == 2) {
+                u = (uint32_t)raw[i * 2] | ((uint32_t)raw[i * 2 + 1] << 8);
+            } else {
+                u = (uint32_t)raw[i * 4] | ((uint32_t)raw[i * 4 + 1] << 8) |
+                    ((uint32_t)raw[i * 4 + 2] << 16) | ((uint32_t)raw[i * 4 + 3] << 24);
+            }
+            if (u == 0 || u > 0x10FFFF) { if (score > best_score) { best_score = score; strcpy(cand, tmp); } break; }
+            if (u < 0x20 || u == 0x7f) { if (score > best_score) { best_score = score; strcpy(cand, tmp); } break; }
+            if (u < 0x80) score++;
+            char t[4] = {0};
+            int n;
+            if (u < 0x80) { t[0] = (char)u; n = 1; }
+            else if (u < 0x800) { t[0] = (char)(0xC0 | (u >> 6)); t[1] = (char)(0x80 | (u & 0x3F)); n = 2; }
+            else if (u < 0x10000) {
+                t[0] = (char)(0xE0 | (u >> 12)); t[1] = (char)(0x80 | ((u >> 6) & 0x3F));
+                t[2] = (char)(0x80 | (u & 0x3F)); n = 3;
+            } else {
+                t[0] = (char)(0xF0 | (u >> 18)); t[1] = (char)(0x80 | ((u >> 12) & 0x3F));
+                t[2] = (char)(0x80 | ((u >> 6) & 0x3F)); t[3] = (char)(0x80 | (u & 0x3F)); n = 4;
+            }
+            if (op + (size_t)n >= sizeof(tmp) - 1) break;
+            memcpy(tmp + op, t, (size_t)n);
+            op += (size_t)n;
+        }
+    }
+    if (best_score >= 0) snprintf(out, osz, "%s", cand);
+    return best_score;
+}
+
 DWORD FormatMessageW(DWORD flags, void* src, DWORD msgid, DWORD lang,
                      wchar_t* buf, DWORD len, void* args) {
     (void)lang;
@@ -2127,9 +2191,34 @@ DWORD FormatMessageW(DWORD flags, void* src, DWORD msgid, DWORD lang,
                              (unsigned long)(uint32_t)av);
                     k32_append_utf8(out8, &op, sizeof(out8), vb);
                 } else {
-                    const uint16_t* ws = (const uint16_t*)(uintptr_t)av;
                     char ub[512] = {0};
-                    if (ws) k32_utf16le_to_utf8(ws, ub, sizeof(ub));
+                    /* On win11 build 22631 the repacked cmd passes scrap values
+                     * for the dir header/volume/serial inserts; render them from
+                     * our own state instead so the output is correct. */
+                    if (msgid == 0x235e && argn == 1) {
+                        size_t uw = 0;
+                        while (g_windows_cwd[uw] && uw < MAX_PATH - 1) uw++;
+                        size_t ubp = 0;
+                        for (size_t ui = 0; ui < uw && ubp < sizeof(ub) - 8; ui++)
+                            k32_append_wchar_utf8(ub, &ubp, sizeof(ub), g_windows_cwd[ui]);
+                    } else if (msgid == 0x235b && argn == 1) {
+                        if (g_windows_cwd[0]) { ub[0] = (char)g_windows_cwd[0]; ub[1] = 0; }
+                    } else if (msgid == 0x2339 && argn == 1) {
+                        snprintf(ub, sizeof(ub), "%04lX-%04lX",
+                                 (unsigned long)(0x12340001u >> 16),
+                                 (unsigned long)(0x12340001u & 0xFFFF));
+                    } else if (av) {
+                        int s1 = k32_decode_insert(av, ub, sizeof(ub));
+                        /* cmd sometimes passes a pointer-to-pointer for strings
+                         * stuck in 4-byte-wchar buffers; prefer the better of
+                         * direct vs one extra dereference. */
+                        uintptr_t inner = 0;
+                        if (k32_safe_read(av, &inner, sizeof(inner)) == 0 && inner && inner != av) {
+                            char ub2[512] = {0};
+                            int s2 = k32_decode_insert(inner, ub2, sizeof(ub2));
+                            if (s2 >= 0 && s2 >= s1) { memcpy(ub, ub2, sizeof(ub)); s1 = s2; }
+                        }
+                    }
                     k32_append_utf8(out8, &op, sizeof(out8), ub);
                 }
                 continue;
@@ -2174,15 +2263,44 @@ BOOL FileTimeToLocalFileTime(const FILETIME* ft, FILETIME* lft) {
     return TRUE;
 }
 
+static void k32_filetime_to_unix(const FILETIME* ft, time_t* out) {
+    uint64_t f = ((uint64_t)ft->dwHighDateTime << 32) | ft->dwLowDateTime;
+    *out = (time_t)((f / 10000000ULL) - 11644473600ULL);
+}
+
 BOOL FileTimeToSystemTime(const FILETIME* ft, void* st) {
-    (void)ft;
-    if (st) memset(st, 0, 16);
+    if (!ft || !st) return FALSE;
+    time_t t;
+    struct tm tm;
+    k32_filetime_to_unix(ft, &t);
+    gmtime_r(&t, &tm);
+    uint16_t* s = (uint16_t*)st;
+    s[0] = (uint16_t)(tm.tm_year + 1900);
+    s[1] = (uint16_t)(tm.tm_mon + 1);
+    s[2] = (uint16_t)tm.tm_wday;
+    s[3] = (uint16_t)tm.tm_mday;
+    s[4] = (uint16_t)tm.tm_hour;
+    s[5] = (uint16_t)tm.tm_min;
+    s[6] = (uint16_t)tm.tm_sec;
+    s[7] = 0;
     return TRUE;
 }
 
 BOOL SystemTimeToFileTime(void* st, FILETIME* ft) {
-    (void)st;
-    if (ft) { ft->dwLowDateTime = 0; ft->dwHighDateTime = 0; }
+    if (!st || !ft) return FALSE;
+    const uint16_t* s = (const uint16_t*)st;
+    struct tm tm = {0};
+    tm.tm_year = (int)s[0] - 1900;
+    tm.tm_mon = (int)s[1] - 1;
+    tm.tm_mday = (int)s[3];
+    tm.tm_hour = (int)s[4];
+    tm.tm_min = (int)s[5];
+    tm.tm_sec = (int)s[6];
+    tm.tm_isdst = -1;
+    time_t t = mktime(&tm);
+    uint64_t f = ((uint64_t)(t + 11644473600LL)) * 10000000ULL;
+    ft->dwLowDateTime = (DWORD)f;
+    ft->dwHighDateTime = (DWORD)(f >> 32);
     return TRUE;
 }
 
@@ -2218,15 +2336,25 @@ DWORD SetThreadLocale(DWORD loc) { (void)loc; return 0x0409; }
 
 BOOL GetTimeFormatW(int loc, DWORD fmt, void* st, const wchar_t* pat,
                     wchar_t* buf, int len) {
-    (void)loc; (void)fmt; (void)st; (void)pat;
-    if (buf && len > 0) k32_utf8_to_utf16le("00:00:00", buf, (size_t)len);
+    (void)loc; (void)fmt; (void)pat;
+    if (!buf || len <= 0) return TRUE;
+    uint16_t s[8] = {1970, 1, 0, 1, 0, 0, 0, 0};
+    if (st) memcpy(s, st, sizeof(s));
+    char t8[64] = {0};
+    snprintf(t8, sizeof(t8), "%02u:%02u:%02u", s[4], s[5], s[6]);
+    k32_utf8_to_utf16le(t8, buf, (size_t)len);
     return TRUE;
 }
 
 BOOL GetDateFormatW(int loc, DWORD fmt, void* st, const wchar_t* pat,
                     wchar_t* buf, int len) {
-    (void)loc; (void)fmt; (void)st; (void)pat;
-    if (buf && len > 0) k32_utf8_to_utf16le("01/01/2025", buf, (size_t)len);
+    (void)loc; (void)fmt; (void)pat;
+    if (!buf || len <= 0) return TRUE;
+    uint16_t s[8] = {1970, 1, 0, 1, 0, 0, 0, 0};
+    if (st) memcpy(s, st, sizeof(s));
+    char t8[64] = {0};
+    snprintf(t8, sizeof(t8), "%02u/%02u/%04u", s[1], s[3], s[0]);
+    k32_utf8_to_utf16le(t8, buf, (size_t)len);
     return TRUE;
 }
 
