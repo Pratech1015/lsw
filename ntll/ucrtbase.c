@@ -537,7 +537,8 @@ static void build_filtered_environ(void) {
         "LS_COLORS", "LSW_MODULE_PATH", "LSW_ROOTFS", "LSW_TRACE_WCSRCHR",
         "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS",
         "COLORTERM", "CONDA_DEFAULT_ENV", "CONDA_PREFIX",
-        "_", NULL
+        /* Host PATH variants would shadow the Windows-style PATH above. */
+        "PATH", "Path", "_", NULL
     };
     static char overrides[16][512];
     int oidx = 0;

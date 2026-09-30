@@ -43,6 +43,15 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    local desc="$1" needle="$2" haystack="$3"
+    if echo "$haystack" | grep -qF "$needle"; then
+        failed "$desc (found '$needle')"
+    else
+        passed "$desc"
+    fi
+}
+
 echo "== LSW Test Suite =="
 echo ""
 
@@ -109,6 +118,36 @@ if [[ -x "$RUNTIME" ]]; then
     assert_contains "cd is case-insensitive and resolves" "C:\\Windows\\System32>" "$out"
     assert_contains "cd .. walks up one level" "C:\\Windows>" "$out"
     assert_contains "cd .. clamps at the drive root" "C:\\>" "$out"
+
+    # mkdir/rmdir must act on the mapped drive, not the host CWD.  Create and
+    # remove a scratch directory so the check is self-cleaning.
+    scratch="lsw_test_dir"
+    rm -rf "${ROOTFS_DIR}/drive_c/${scratch}"
+    out="$(printf 'md %s\ncd %s\ncd\ncd ..\nrd %s\nexit\n' "$scratch" "$scratch" "$scratch" \
+        | timeout 20 "$RUNTIME" "${ROOTFS_DIR}/drive_c/Windows/System32/cmd.exe" 2>/dev/null || true)"
+    if [[ -d "${ROOTFS_DIR}/drive_c/${scratch}" ]]; then
+        failed "mkdir creates the directory on the mapped drive"
+    else
+        passed "mkdir creates the directory on the mapped drive"
+    fi
+    assert_contains "cd into a fresh directory works" "C:\\${scratch}>" "$out"
+    assert_contains "cd .. returns to the drive root" "C:\\>" "$out"
+    if [[ -d "${ROOTFS_DIR}/drive_c/${scratch}" ]]; then
+        failed "rmdir removes the directory from the mapped drive"
+    else
+        passed "rmdir removes the directory from the mapped drive"
+    fi
+
+    # Environment variables must be reported as Windows paths.  Leaking the
+    # host rootfs prefix into %PATH% breaks every PATH lookup in the guest.
+    out="$(printf 'echo %%PATH%%\necho %%COMSPEC%%\necho %%TEMP%%\nexit\n' \
+        | timeout 20 "$RUNTIME" "${ROOTFS_DIR}/drive_c/Windows/System32/cmd.exe" 2>/dev/null || true)"
+    assert_contains "PATH is a Windows-style path list" \
+        'C:\Windows\System32;C:\Windows' "$out"
+    assert_contains "COMSPEC is a Windows-style path" \
+        'C:\Windows\System32\cmd.exe' "$out"
+    assert_not_contains "environment does not leak the host rootfs" \
+        "$ROOTFS_DIR" "$out"
 else
     todo "builtin cmd.exe test"
 fi

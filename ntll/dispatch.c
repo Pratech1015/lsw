@@ -48,6 +48,13 @@ BOOL win32_remove_directory(const char*);
 BOOL win32_delete_file(const char*);
 BOOL win32_move_file(const char*,const char*);
 BOOL win32_copy_file(const char*,const char*,BOOL);
+BOOL win32_create_directory_w(const unsigned short*,void*);
+BOOL win32_remove_directory_w(const unsigned short*);
+BOOL win32_delete_file_w(const unsigned short*);
+BOOL win32_move_file_w(const unsigned short*,const unsigned short*);
+BOOL win32_copy_file_w(const unsigned short*,const unsigned short*,BOOL);
+BOOL win32_set_file_attributes_w(const unsigned short*,DWORD);
+HANDLE CreateFileW_impl(const unsigned short*,DWORD,DWORD,void*,DWORD,DWORD,HANDLE);
 DWORD win32_get_file_attributes(const char*);
 DWORD GetFileAttributesW_impl(const wchar_t*);
 BOOL win32_set_file_attributes(const char*,DWORD);
@@ -351,7 +358,7 @@ static const API_ENTRY g_api_table[] = {
     {"kernel32.dll","GetLastError",(void*)win32_get_last_error},
     {"kernel32.dll","SetLastError",(void*)win32_set_last_error},
     {"kernel32.dll","CreateFileA",(void*)win32_create_file},
-    {"kernel32.dll","CreateFileW",(void*)win32_create_file},
+    {"kernel32.dll","CreateFileW",(void*)CreateFileW_impl},
     {"kernel32.dll","ReadFile",(void*)win32_read_file},
     {"kernel32.dll","WriteFile",(void*)win32_write_file},
     {"kernel32.dll","CloseHandle",(void*)win32_close_handle},
@@ -387,13 +394,13 @@ static const API_ENTRY g_api_table[] = {
     {"kernel32.dll","GetTempFileNameA",(void*)win32_get_temp_file_name},
     {"kernel32.dll","GetTempFileNameW",(void*)win32_get_temp_file_name},
     {"kernel32.dll","CreateDirectoryA",(void*)win32_create_directory},
-    {"kernel32.dll","CreateDirectoryW",(void*)win32_create_directory},
+    {"kernel32.dll","CreateDirectoryW",(void*)win32_create_directory_w},
     {"kernel32.dll","RemoveDirectoryA",(void*)win32_remove_directory},
-    {"kernel32.dll","RemoveDirectoryW",(void*)win32_remove_directory},
+    {"kernel32.dll","RemoveDirectoryW",(void*)win32_remove_directory_w},
     {"kernel32.dll","DeleteFileA",(void*)win32_delete_file},
-    {"kernel32.dll","DeleteFileW",(void*)win32_delete_file},
+    {"kernel32.dll","DeleteFileW",(void*)win32_delete_file_w},
     {"kernel32.dll","MoveFileA",(void*)win32_move_file},
-    {"kernel32.dll","MoveFileW",(void*)win32_move_file},
+    {"kernel32.dll","MoveFileW",(void*)win32_move_file_w},
     {"kernel32.dll","MoveFileExA",(void*)win32_move_file},
     {"kernel32.dll","MoveFileExW",(void*)MoveFileExW},
     {"kernel32.dll","MoveFileWithProgressW",(void*)MoveFileWithProgressW},
@@ -404,7 +411,7 @@ static const API_ENTRY g_api_table[] = {
     {"kernel32.dll","GetFileAttributesA",(void*)win32_get_file_attributes},
     {"kernel32.dll","GetFileAttributesW",(void*)GetFileAttributesW_impl},
     {"kernel32.dll","SetFileAttributesA",(void*)win32_set_file_attributes},
-    {"kernel32.dll","SetFileAttributesW",(void*)win32_set_file_attributes},
+    {"kernel32.dll","SetFileAttributesW",(void*)win32_set_file_attributes_w},
     {"kernel32.dll","SetCurrentDirectoryA",(void*)win32_set_current_directory},
     {"kernel32.dll","SetCurrentDirectoryW",(void*)SetCurrentDirectoryW_impl},
     {"kernel32.dll","GetCurrentDirectoryA",(void*)win32_get_current_directory},

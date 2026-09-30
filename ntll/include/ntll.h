@@ -307,6 +307,16 @@ BOOL win32_remove_directory(const char* path);
 BOOL win32_delete_file(const char* path);
 BOOL win32_move_file(const char* from, const char* to);
 BOOL win32_copy_file(const char* from, const char* to, BOOL failIfExists);
+/* Wide (UTF-16LE) entry points: the PE hands us 2-byte-unit buffers, so these
+ * must not share the A shims above. */
+BOOL win32_create_directory_w(const uint16_t* wpath, void* sa);
+BOOL win32_remove_directory_w(const uint16_t* wpath);
+BOOL win32_delete_file_w(const uint16_t* wpath);
+BOOL win32_move_file_w(const uint16_t* wfrom, const uint16_t* wto);
+BOOL win32_copy_file_w(const uint16_t* wfrom, const uint16_t* wto, BOOL failIfExists);
+BOOL win32_set_file_attributes_w(const uint16_t* wpath, DWORD attrs);
+HANDLE CreateFileW_impl(const uint16_t* wpath, DWORD access, DWORD share,
+                        void* sa, DWORD create, DWORD flags, HANDLE templ);
 DWORD win32_get_file_attributes(const char* path);
 BOOL win32_set_file_attributes(const char* path, DWORD attrs);
 BOOL win32_find_first_file(const char* pattern, void* find_data);

@@ -30,7 +30,12 @@ char* g_image_path = NULL;
 #define WINDOWS_TICK ((uint64_t)10000000)
 #define SEC_TO_UNIX_EPOCH ((uint64_t)11644473600LL)
 #define ERROR_FILE_NOT_FOUND 0x02
+#define ERROR_PATH_NOT_FOUND 0x03
 #define ERROR_INVALID_HANDLE 0x6
+#define FILE_TYPE_UNKNOWN 0x0000
+#define FILE_TYPE_DISK    0x0001
+#define FILE_TYPE_CHAR    0x0002
+#define FILE_TYPE_PIPE    0x0003
 #define FILE_ATTRIBUTE_READONLY  0x0001
 #define FILE_ATTRIBUTE_HIDDEN    0x0002
 #define FILE_ATTRIBUTE_DIRECTORY 0x0010
@@ -56,12 +61,17 @@ static DWORD errno_to_win32(int e) {
         case ENFILE:    return 0x04;
         case ENOSYS:    return 0x1C;
         case EPERM:     return 0x05;
+        case ENOTEMPTY: return 0x91;  /* ERROR_DIR_NOT_EMPTY */
         default:        return 0x0A;
     }
 }
 
 // Windows HANDLEs are mapped to Linux fds via a global table.
+// The slot index lives in the low bits; a high tag bit marks the value as one
+// of ours so real CRT fds (0/1/2, ...) are never mistaken for table entries.
 #define MAX_WIN_HANDLES 4096
+#define HANDLE_SLOT_MASK 0xFFFFu
+#define HANDLE_SLOT_TAG  0x10000u
 static int g_handle_table[MAX_WIN_HANDLES];
 static pthread_mutex_t g_handle_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -75,7 +85,7 @@ HANDLE win32_handle_alloc(int linux_fd) {
         if (g_handle_table[i] == -1) {
             g_handle_table[i] = linux_fd;
             pthread_mutex_unlock(&g_handle_lock);
-            return (HANDLE)(uintptr_t)(0x100 | i);
+            return (HANDLE)(uintptr_t)(HANDLE_SLOT_TAG | i);
         }
     }
     pthread_mutex_unlock(&g_handle_lock);
@@ -83,13 +93,13 @@ HANDLE win32_handle_alloc(int linux_fd) {
 }
 
 static int handle_lookup(HANDLE h) {
-    int slot = (int)((uintptr_t)h & 0xFFF);
+    int slot = (int)((uintptr_t)h & HANDLE_SLOT_MASK);
     if (slot < 0 || slot >= MAX_WIN_HANDLES) return -1;
     return g_handle_table[slot];
 }
 
 static void handle_free(HANDLE h) {
-    int slot = (int)((uintptr_t)h & 0xFFF);
+    int slot = (int)((uintptr_t)h & HANDLE_SLOT_MASK);
     if (slot >= 0 && slot < MAX_WIN_HANDLES) g_handle_table[slot] = -1;
 }
 
@@ -240,6 +250,32 @@ const char* nt_get_system32_dir(void) {
     return sys32;
 }
 
+// Resolve a UTF-16 Windows path (which may be relative) against the process
+// CWD to a host Unix path.  Callers that act on files must pass the buffer as
+// the exact pointer the PE handed us (UTF-16LE 2-byte units), never a
+// host-char path, or the first UTF-16 code unit is misread as a C string.
+static int k32_winpath_to_unix(const uint16_t* wpath, char* unix_path, int max_len) {
+    char upath[2048];
+    char abs[2048];
+    k32_utf16le_to_utf8(wpath, upath, sizeof(upath));
+    if (upath[0] && upath[1] != ':' && upath[0] != '\\') {
+        ensure_cwd_init();
+        char wincwd[2048];
+        k32_utf16le_to_utf8((const uint16_t*)g_windows_cwd, wincwd, sizeof(wincwd));
+        if (wincwd[0] && wincwd[1] == ':' && (wincwd[2] == '\\' || wincwd[2] == '\0')) {
+            size_t cl = strlen(wincwd);
+            /* only add a separator when the CWD does not already end in one */
+            snprintf(abs, sizeof(abs), "%s%s%s", wincwd,
+                     (cl && wincwd[cl - 1] == '\\') ? "" : "\\", upath);
+        } else {
+            snprintf(abs, sizeof(abs), "C:\\%s", upath);
+        }
+    } else {
+        snprintf(abs, sizeof(abs), "%s", upath);
+    }
+    return nt_to_unix_path(abs, unix_path, max_len);
+}
+
 int nt_to_unix_path(const char* nt_path, char* unix_path, int max_len) {
     const char* system_root = nt_get_system_root();
     char buffer[MAX_PATH * 4];
@@ -325,6 +361,43 @@ BOOL win32_read_file(HANDLE handle, void* buf, DWORD len, DWORD* bytes_read,
     if (n < 0) { win32_set_last_error(errno_to_win32(errno)); return FALSE; }
     if (bytes_read) *bytes_read = (DWORD)n;
     return TRUE;
+}
+
+/* Length-aware UTF-16LE -> UTF-8. `n` counts uint16_t units, so callers can
+ * convert a buffer whose length came from WriteFile/ReadFile byte counts
+ * without relying on NUL termination. */
+static HANDLE g_std_handles[3];
+static int std_handles_initialized;
+
+static size_t k32_utf16_to_utf8_n(const uint16_t* w, size_t n, char* out, size_t max_out) {
+    size_t o = 0;
+    for (size_t i = 0; i < n && o + 4 < max_out; i++) {
+        uint32_t cp = w[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < n) {
+            uint32_t lo = w[i + 1];
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                i++;
+            }
+        }
+        if (cp < 0x80) {
+            out[o++] = (char)cp;
+        } else if (cp < 0x800) {
+            out[o++] = (char)(0xC0 | (cp >> 6));
+            out[o++] = (char)(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out[o++] = (char)(0xE0 | (cp >> 12));
+            out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[o++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            out[o++] = (char)(0xF0 | (cp >> 18));
+            out[o++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+            out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[o++] = (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    if (o < max_out) out[o] = 0;
+    return o;
 }
 
 BOOL win32_write_file(HANDLE handle, void* buf, DWORD len, DWORD* written,
@@ -447,10 +520,7 @@ DWORD win32_get_temp_file_name(const char* path, const char* prefix,
 
 // ---- Directories and attributes ----
 
-BOOL win32_create_directory(const char* path, void* sa) {
-    (void)sa;
-    char unix_path[MAX_PATH * 4];
-    nt_to_unix_path(path, unix_path, sizeof(unix_path));
+static BOOL k32_mkdir_unix(const char* unix_path) {
     if (mkdir(unix_path, 0755) != 0) {
         win32_set_last_error(errno_to_win32(errno));
         return FALSE;
@@ -458,9 +528,7 @@ BOOL win32_create_directory(const char* path, void* sa) {
     return TRUE;
 }
 
-BOOL win32_remove_directory(const char* path) {
-    char unix_path[MAX_PATH * 4];
-    nt_to_unix_path(path, unix_path, sizeof(unix_path));
+static BOOL k32_rmdir_unix(const char* unix_path) {
     if (rmdir(unix_path) != 0) {
         win32_set_last_error(errno_to_win32(errno));
         return FALSE;
@@ -468,9 +536,7 @@ BOOL win32_remove_directory(const char* path) {
     return TRUE;
 }
 
-BOOL win32_delete_file(const char* path) {
-    char unix_path[MAX_PATH * 4];
-    nt_to_unix_path(path, unix_path, sizeof(unix_path));
+static BOOL k32_unlink_unix(const char* unix_path) {
     if (unlink(unix_path) != 0) {
         win32_set_last_error(errno_to_win32(errno));
         return FALSE;
@@ -478,10 +544,7 @@ BOOL win32_delete_file(const char* path) {
     return TRUE;
 }
 
-BOOL win32_move_file(const char* from, const char* to) {
-    char from_u[MAX_PATH * 4], to_u[MAX_PATH * 4];
-    nt_to_unix_path(from, from_u, sizeof(from_u));
-    nt_to_unix_path(to, to_u, sizeof(to_u));
+static BOOL k32_rename_unix(const char* from_u, const char* to_u) {
     if (rename(from_u, to_u) != 0) {
         win32_set_last_error(errno_to_win32(errno));
         return FALSE;
@@ -489,11 +552,7 @@ BOOL win32_move_file(const char* from, const char* to) {
     return TRUE;
 }
 
-BOOL win32_copy_file(const char* from, const char* to, BOOL failIfExists) {
-    char from_u[MAX_PATH * 4], to_u[MAX_PATH * 4];
-    nt_to_unix_path(from, from_u, sizeof(from_u));
-    nt_to_unix_path(to, to_u, sizeof(to_u));
-
+static BOOL k32_copy_unix(const char* from_u, const char* to_u, BOOL failIfExists) {
     int src = open(from_u, O_RDONLY);
     if (src < 0) { win32_set_last_error(errno_to_win32(errno)); return FALSE; }
     int dst = open(to_u, O_WRONLY | O_CREAT | (failIfExists ? O_EXCL : O_TRUNC), 0644);
@@ -506,6 +565,109 @@ BOOL win32_copy_file(const char* from, const char* to, BOOL failIfExists) {
     }
     close(src);
     close(dst);
+    return TRUE;
+}
+
+/* W-API: the PE hands us UTF-16LE buffers.
+ * These are the real entry points (the repacked cmd uses W calls
+ * exclusively); the A variants below are for completeness. */
+
+BOOL win32_create_directory_w(const uint16_t* wpath, void* sa) {
+    (void)sa;
+    char unix_path[MAX_PATH * 4];
+    if (k32_winpath_to_unix(wpath, unix_path, sizeof(unix_path)) != 0) return FALSE;
+    return k32_mkdir_unix(unix_path);
+}
+
+BOOL win32_remove_directory_w(const uint16_t* wpath) {
+    char unix_path[MAX_PATH * 4];
+    if (k32_winpath_to_unix(wpath, unix_path, sizeof(unix_path)) != 0) return FALSE;
+    return k32_rmdir_unix(unix_path);
+}
+
+BOOL win32_delete_file_w(const uint16_t* wpath) {
+    char unix_path[MAX_PATH * 4];
+    if (k32_winpath_to_unix(wpath, unix_path, sizeof(unix_path)) != 0) return FALSE;
+    return k32_unlink_unix(unix_path);
+}
+
+BOOL win32_move_file_w(const uint16_t* wfrom, const uint16_t* wto) {
+    char from_u[MAX_PATH * 4], to_u[MAX_PATH * 4];
+    if (k32_winpath_to_unix(wfrom, from_u, sizeof(from_u)) != 0) return FALSE;
+    if (k32_winpath_to_unix(wto, to_u, sizeof(to_u)) != 0) return FALSE;
+    return k32_rename_unix(from_u, to_u);
+}
+
+BOOL win32_copy_file_w(const uint16_t* wfrom, const uint16_t* wto, BOOL failIfExists) {
+    char from_u[MAX_PATH * 4], to_u[MAX_PATH * 4];
+    if (k32_winpath_to_unix(wfrom, from_u, sizeof(from_u)) != 0) return FALSE;
+    if (k32_winpath_to_unix(wto, to_u, sizeof(to_u)) != 0) return FALSE;
+    return k32_copy_unix(from_u, to_u, failIfExists);
+}
+
+BOOL win32_set_file_attributes_w(const uint16_t* wpath, DWORD attrs) {
+    char unix_path[MAX_PATH * 4];
+    if (k32_winpath_to_unix(wpath, unix_path, sizeof(unix_path)) != 0) return FALSE;
+    struct stat st;
+    if (stat(unix_path, &st) != 0) {
+        win32_set_last_error(errno_to_win32(errno));
+        return FALSE;
+    }
+    mode_t m = st.st_mode;
+    if (attrs & FILE_ATTRIBUTE_READONLY) m &= ~(S_IWUSR | S_IWGRP | S_IWOTH);
+    else m |= S_IWUSR;
+    if (chmod(unix_path, m) != 0) {
+        win32_set_last_error(errno_to_win32(errno));
+        return FALSE;
+    }
+    return TRUE;
+}
+
+HANDLE CreateFileW_impl(const uint16_t* wpath, DWORD access, DWORD share,
+                        void* sa, DWORD create, DWORD flags, HANDLE templ) {
+    char unix_path[MAX_PATH * 4];
+    if (!wpath || k32_winpath_to_unix(wpath, unix_path, sizeof(unix_path)) != 0) {
+        win32_set_last_error(ERROR_PATH_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    return win32_create_file(unix_path, access, share, sa, create, flags, templ);
+}
+
+BOOL win32_create_directory(const char* path, void* sa) {
+    (void)sa;
+    char unix_path[MAX_PATH * 4];
+    if (nt_to_unix_path(path, unix_path, sizeof(unix_path)) != 0) return FALSE;
+    return k32_mkdir_unix(unix_path);
+}
+
+BOOL win32_remove_directory(const char* path) {
+    char unix_path[MAX_PATH * 4];
+    if (nt_to_unix_path(path, unix_path, sizeof(unix_path)) != 0) return FALSE;
+    return k32_rmdir_unix(unix_path);
+}
+
+BOOL win32_delete_file(const char* path) {
+    char unix_path[MAX_PATH * 4];
+    if (nt_to_unix_path(path, unix_path, sizeof(unix_path)) != 0) return FALSE;
+    return k32_unlink_unix(unix_path);
+}
+
+BOOL win32_move_file(const char* from, const char* to) {
+    char from_u[MAX_PATH * 4], to_u[MAX_PATH * 4];
+    if (nt_to_unix_path(from, from_u, sizeof(from_u)) != 0) return FALSE;
+    if (nt_to_unix_path(to, to_u, sizeof(to_u)) != 0) return FALSE;
+    return k32_rename_unix(from_u, to_u);
+}
+
+BOOL win32_copy_file(const char* from, const char* to, BOOL failIfExists) {
+    char from_u[MAX_PATH * 4], to_u[MAX_PATH * 4];
+    if (nt_to_unix_path(from, from_u, sizeof(from_u)) != 0) return FALSE;
+    if (nt_to_unix_path(to, to_u, sizeof(to_u)) != 0) return FALSE;
+    return k32_copy_unix(from_u, to_u, failIfExists);
+}
+
+BOOL win32_set_file_attributes(const char* path, DWORD attrs) {
+    (void)path; (void)attrs;
     return TRUE;
 }
 
@@ -563,11 +725,11 @@ static int k32_ci_stat(const char* unix_path, struct stat* st) {
 
 DWORD GetFileAttributesW_impl(const wchar_t* wpath) {
     if (!wpath) { win32_set_last_error(87); return 0xFFFFFFFF; }
-    char upath[2048];
-    k32_utf16le_to_utf8(wpath, upath, sizeof(upath));
-    for (char* s = upath; *s; s++) { if (*s == '\\') *s = '/'; }
     char unix_path[MAX_PATH * 4];
-    nt_to_unix_path(upath, unix_path, sizeof(unix_path));
+    if (k32_winpath_to_unix((const uint16_t*)wpath, unix_path, sizeof(unix_path)) != 0) {
+        win32_set_last_error(ERROR_PATH_NOT_FOUND);
+        return 0xFFFFFFFF;
+    }
     struct stat st;
     if (k32_ci_stat(unix_path, &st) != 0) {
         win32_set_last_error(errno_to_win32(errno));
@@ -575,11 +737,6 @@ DWORD GetFileAttributesW_impl(const wchar_t* wpath) {
     }
     if (S_ISDIR(st.st_mode)) return FILE_ATTRIBUTE_DIRECTORY;
     return FILE_ATTRIBUTE_NORMAL;
-}
-
-BOOL win32_set_file_attributes(const char* path, DWORD attrs) {
-    (void)path; (void)attrs;
-    return TRUE;
 }
 
 BOOL win32_set_current_directory(const char* path) {
@@ -622,19 +779,12 @@ BOOL win32_read_console_input(HANDLE c, void* recs, DWORD count, DWORD* read) {
 }
 BOOL win32_write_console(HANDLE c, void* buf, DWORD len,
                         DWORD* written, void* reserved) {
-    (void)c; (void)reserved;
-    const uint16_t* wbuf = (const uint16_t*)buf;
-    for (DWORD i = 0; i < len; i++) {
-        uint16_t ch = wbuf[i];
-        if (ch < 0x80) {
-            fputc((char)ch, stdout);
-        } else {
-            wchar_t wc = (wchar_t)ch;
-            char mb[4];
-            int n = wctomb(mb, wc);
-            if (n > 0) fwrite(mb, 1, n, stdout);
-        }
-    }
+    (void)reserved;
+    (void)c;
+    DWORD units = len;
+    char out8[4096];
+    k32_utf16_to_utf8_n((const uint16_t*)buf, units, out8, sizeof(out8));
+    fwrite(out8, 1, strlen(out8), stdout);
     fflush(stdout);
     if (written) *written = len;
     return TRUE;
@@ -903,29 +1053,22 @@ DWORD GetEnvironmentVariableW(const wchar_t* wname, wchar_t* buf, DWORD size) {
     k32_utf16le_to_utf8(wname, name, sizeof(name));
 
     /* Windows path overrides for key environment variables */
-    const char* rootfs = nt_get_system_root();
     const char* val = NULL;
     char override[1024] = {0};
 
     if (name[0] == '=') {
         val = k32_hidden_var_get(name);
     } else if (strcasecmp(name, "PATH") == 0) {
-        snprintf(override, sizeof(override),
-                 "%s/drive_c/Windows/System32;%s/drive_c/Windows;"
-                 "%s/drive_c/Windows/System32/WindowsPowerShell/v1.0;"
-                 "%s/drive_c", rootfs, rootfs, rootfs, rootfs);
-        val = override;
+        val = "C:\\Windows\\System32;C:\\Windows;"
+              "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\";
     } else if (strcasecmp(name, "PROMPT") == 0) {
         val = "$P$G";
     } else if (strcasecmp(name, "COMSPEC") == 0) {
-        snprintf(override, sizeof(override), "%s/drive_c/Windows/System32/cmd.exe", rootfs);
-        val = override;
+        val = "C:\\Windows\\System32\\cmd.exe";
     } else if (strcasecmp(name, "TEMP") == 0 || strcasecmp(name, "TMP") == 0) {
-        snprintf(override, sizeof(override), "%s/drive_c/Windows/Temp", rootfs);
-        val = override;
+        val = "C:\\Windows\\Temp";
     } else if (strcasecmp(name, "SYSTEMROOT") == 0 || strcasecmp(name, "WINDIR") == 0) {
-        snprintf(override, sizeof(override), "%s", rootfs);
-        val = override;
+        val = "C:\\Windows";
     } else if (strcasecmp(name, "SYSTEMDRIVE") == 0) {
         val = "C:";
     } else if (strcasecmp(name, "HOMEDRIVE") == 0) {
@@ -934,8 +1077,8 @@ DWORD GetEnvironmentVariableW(const wchar_t* wname, wchar_t* buf, DWORD size) {
         snprintf(override, sizeof(override), "\\Users\\%s", getenv("USER") ? getenv("USER") : "user");
         val = override;
     } else if (strcasecmp(name, "USERPROFILE") == 0) {
-        snprintf(override, sizeof(override), "%s/drive_c/Users/%s",
-                 rootfs, getenv("USER") ? getenv("USER") : "user");
+        snprintf(override, sizeof(override), "C:\\Users\\%s",
+                 getenv("USER") ? getenv("USER") : "user");
         val = override;
     } else {
         val = getenv(name);
@@ -1343,9 +1486,6 @@ BOOL DuplicateHandle(HANDLE src, HANDLE hsrc, HANDLE dst, HANDLE* hdst,
 
 // ── Console ────────────────────────────────────────────────────
 
-static HANDLE g_std_handles[3] = {0};
-static int std_handles_initialized = 0;
-
 HANDLE GetStdHandle(DWORD n) {
     /* Windows STD_INPUT_HANDLE = -10, STD_OUTPUT_HANDLE = -11, STD_ERROR_HANDLE = -12 */
     int idx = -1;
@@ -1552,10 +1692,6 @@ BOOL FindNextStreamWStub(HANDLE a, void* b) { (void)a; (void)b; return FALSE; }
 
 // ── File: attributes / info ────────────────────────────────────
 
-#define FILE_TYPE_UNKNOWN       0x0000
-#define FILE_TYPE_DISK          0x0001
-#define FILE_TYPE_CHAR          0x0002
-#define FILE_TYPE_PIPE          0x0003
 #define FILE_TYPE_REMOTE        0x8000
 
 // CRT standard fds 0/1/2 map directly to Linux stdin/stdout/stderr; the
@@ -1588,11 +1724,8 @@ BOOL GetFileInformationByHandleEx(HANDLE h, int cls, void* buf, DWORD sz) {
 BOOL GetFileAttributesExW(const wchar_t* p, int cls, void* data) {
     (void)cls;
     if (!p || !data) return FALSE;
-    char upath[2048];
-    k32_utf16le_to_utf8(p, upath, sizeof(upath));
-    for (char* s = upath; *s; s++) { if (*s == '\\') *s = '/'; }
     char unix_path[MAX_PATH * 4];
-    nt_to_unix_path(upath, unix_path, sizeof(unix_path));
+    if (k32_winpath_to_unix((const uint16_t*)p, unix_path, sizeof(unix_path)) != 0) return FALSE;
     struct stat st;
     if (k32_ci_stat(unix_path, &st) != 0) return FALSE;
     memset(data, 0, 40);
@@ -1716,12 +1849,7 @@ BOOL SetFileTime(HANDLE h, void* c, void* a, void* w) {
 
 BOOL MoveFileExW(const wchar_t* a, const wchar_t* b, DWORD flags) {
     (void)flags;
-    char ua[2048], ub[2048];
-    k32_utf16le_to_utf8(a, ua, sizeof(ua));
-    k32_utf16le_to_utf8(b, ub, sizeof(ub));
-    for (char* p = ua; *p; p++) if (*p == '\\') *p = '/';
-    for (char* p = ub; *p; p++) if (*p == '\\') *p = '/';
-    return rename(ua, ub) == 0;
+    return win32_move_file_w((const uint16_t*)a, (const uint16_t*)b);
 }
 
 BOOL MoveFileWithProgressW(const wchar_t* a, const wchar_t* b, void* prog, void* data, DWORD flags) {
@@ -1730,20 +1858,7 @@ BOOL MoveFileWithProgressW(const wchar_t* a, const wchar_t* b, void* prog, void*
 }
 
 BOOL CopyFileW(const wchar_t* a, const wchar_t* b, BOOL fail) {
-    (void)fail;
-    char ua[2048], ub[2048];
-    k32_utf16le_to_utf8(a, ua, sizeof(ua));
-    k32_utf16le_to_utf8(b, ub, sizeof(ub));
-    for (char* p = ua; *p; p++) if (*p == '\\') *p = '/';
-    for (char* p = ub; *p; p++) if (*p == '\\') *p = '/';
-    int in = open(ua, O_RDONLY);
-    if (in < 0) return FALSE;
-    int out = open(ub, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (out < 0) { close(in); return FALSE; }
-    char buf[8192]; ssize_t n;
-    while ((n = read(in, buf, sizeof(buf))) > 0) write(out, buf, (size_t)n);
-    close(in); close(out);
-    return TRUE;
+    return win32_copy_file_w((const uint16_t*)a, (const uint16_t*)b, fail);
 }
 
 BOOL CopyFileExW(const wchar_t* a, const wchar_t* b, void* prog,
@@ -1759,20 +1874,16 @@ void SetConsoleInputExeNameW(const wchar_t* name) {
 BOOL CreateHardLinkW(const wchar_t* a, const wchar_t* b, void* sa) {
     (void)sa;
     char ua[2048], ub[2048];
-    k32_utf16le_to_utf8(a, ua, sizeof(ua));
-    k32_utf16le_to_utf8(b, ub, sizeof(ub));
-    for (char* p = ua; *p; p++) if (*p == '\\') *p = '/';
-    for (char* p = ub; *p; p++) if (*p == '\\') *p = '/';
+    if (k32_winpath_to_unix((const uint16_t*)a, ua, sizeof(ua)) != 0) return FALSE;
+    if (k32_winpath_to_unix((const uint16_t*)b, ub, sizeof(ub)) != 0) return FALSE;
     return link(ub, ua) == 0;
 }
 
 BOOL CreateSymbolicLinkW(const wchar_t* a, const wchar_t* b, DWORD flags) {
     (void)flags;
     char ua[2048], ub[2048];
-    k32_utf16le_to_utf8(a, ua, sizeof(ua));
-    k32_utf16le_to_utf8(b, ub, sizeof(ub));
-    for (char* p = ua; *p; p++) if (*p == '\\') *p = '/';
-    for (char* p = ub; *p; p++) if (*p == '\\') *p = '/';
+    if (k32_winpath_to_unix((const uint16_t*)a, ua, sizeof(ua)) != 0) return FALSE;
+    if (k32_winpath_to_unix((const uint16_t*)b, ub, sizeof(ub)) != 0) return FALSE;
     return symlink(ub, ua) == 0;
 }
 
@@ -1982,6 +2093,7 @@ static const struct FMT_SYSMSG g_sys_msgs[] = {
     { 0x2711, "%1 File(s) %2 bytes" },
     { 0x2712, "%1 Dir(s) %2 bytes free" },
     { 0x40002711, " File(s) bytes" },
+    { 0x40002712, " File(s)" },
 };
 
 static const char* k32_sys_msg(DWORD code) {
