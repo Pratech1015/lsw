@@ -105,8 +105,10 @@ if [[ -x "$RUNTIME" ]]; then
     assert_contains "echo works for second command" "testing 123" "$out"
     out="$(printf 'dir\nexit\n' | timeout 20 "$RUNTIME" "${ROOTFS_DIR}/drive_c/Windows/System32/cmd.exe" 2>/dev/null || true)"
     assert_contains "dir lists C:\ root" "Windows" "$out"
-    out="$(printf 'cd WINDOWS\ncd system32\ncd ..\nexit\n' | timeout 20 "$RUNTIME" "${ROOTFS_DIR}/drive_c/Windows/System32/cmd.exe" 2>/dev/null || true)"
+    out="$(printf 'cd WINDOWS\ncd system32\ncd ..\ncd ..\ncd ..\nexit\n' | timeout 20 "$RUNTIME" "${ROOTFS_DIR}/drive_c/Windows/System32/cmd.exe" 2>/dev/null || true)"
     assert_contains "cd is case-insensitive and resolves" "C:\\Windows\\System32>" "$out"
+    assert_contains "cd .. walks up one level" "C:\\Windows>" "$out"
+    assert_contains "cd .. clamps at the drive root" "C:\\>" "$out"
 else
     todo "builtin cmd.exe test"
 fi

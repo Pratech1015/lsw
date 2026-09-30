@@ -1827,18 +1827,24 @@ DWORD GetFullPathNameW(const wchar_t* file, DWORD len, wchar_t* buf, wchar_t** p
             /* Rebuild a Windows path from the canonical host path by taking
              * the suffix after the drive_? mount component.  This is robust to
              * where the rootfs actually lives (absolute, relative, or
-             * symlinked), unlike a system_root string-prefix comparison. */
+             * symlinked), unlike a system_root string-prefix comparison.  If
+             * the canonical path is at or above the drive mount (e.g. ".." at
+             * the drive root), clamp back to the root: Windows never goes
+             * above a drive. */
+            char nt_result[MAX_PATH];
+            char drv = (winpath[0] >= 'A' && winpath[0] <= 'Z') ? winpath[0] : 'C';
             char* d = strstr(canon, "/drive_");
             if (d && ((d[7] >= 'a' && d[7] <= 'z') || (d[7] >= 'A' && d[7] <= 'Z')) &&
                 (d[8] == '/' || d[8] == '\0')) {
-                char nt_result[MAX_PATH];
-                char drv = (d[7] >= 'a' && d[7] <= 'z') ? (char)(d[7] - 'a' + 'A') : d[7];
-                d += 9;
-                while (*d == '/') d++;
+                drv = (d[7] >= 'a' && d[7] <= 'z') ? (char)(d[7] - 'a' + 'A') : d[7];
+                d += 8;                         /* past "/drive_?" */
+                if (*d == '/') d++;             /* skip separator if present */
                 snprintf(nt_result, sizeof(nt_result), "%c:\\%s", drv, d);
-                for (char* p = nt_result; *p; p++) if (*p == '/') *p = '\\';
-                snprintf(winpath, sizeof(winpath), "%s", nt_result);
+            } else {
+                snprintf(nt_result, sizeof(nt_result), "%c:\\", drv);
             }
+            for (char* p = nt_result; *p; p++) if (*p == '/') *p = '\\';
+            snprintf(winpath, sizeof(winpath), "%s", nt_result);
         }
         if (len < 4) { win32_set_last_error(122); return (DWORD)strlen(winpath); }
         int n = k32_utf8_to_utf16le(winpath, buf, (size_t)len);
