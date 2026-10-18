@@ -1,0 +1,12 @@
+build/
+dist/
+*.o
+*.d
+*.a
+*.so
+*.img
+*.qcow2
+*.iso
+*.swp
+*~
+.DS_Store
